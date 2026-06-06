@@ -58,6 +58,19 @@ class Database:
                 t.video_count = max(0, t.video_count + delta)
                 t.heat = max(0, t.heat + delta * 100)
 
+    def add_topic_interaction(self, topic_ids: List[str], views: int = 0, likes: int = 0,
+                              comments: int = 0, collects: int = 0, shares: int = 0):
+        for tid in topic_ids:
+            t = self.topics.get(tid)
+            if t:
+                t.views_count += views
+                t.likes_count += likes
+                t.comments_count += comments
+                t.collects_count += collects
+                t.shares_count += shares
+                heat_delta = views + likes * 2 + comments * 3 + collects * 2 + shares * 5
+                t.heat += heat_delta
+
     def add_topic_views(self, topic_id: str, views: int):
         t = self.topics.get(topic_id)
         if t:
@@ -97,12 +110,12 @@ class Database:
             self.users[u.id] = u
 
         mock_topics = [
-            Topic(id='t1', name='美食探店', description='分享各地美食探店体验', video_count=12500, views_count=8900000, cover='https://picsum.photos/seed/t1/400/300', heat=98000, created_at=now - 86400000 * 300),
-            Topic(id='t2', name='旅行vlog', description='记录旅行中的美好时光', video_count=23400, views_count=15000000, cover='https://picsum.photos/seed/t2/400/300', heat=87000, created_at=now - 86400000 * 280),
-            Topic(id='t3', name='科技数码', description='最新科技产品评测分享', video_count=8900, views_count=6700000, cover='https://picsum.photos/seed/t3/400/300', heat=76000, created_at=now - 86400000 * 250),
-            Topic(id='t4', name='健身打卡', description='一起健身，打卡每一天', video_count=18700, views_count=9800000, cover='https://picsum.photos/seed/t4/400/300', heat=65000, created_at=now - 86400000 * 200),
-            Topic(id='t5', name='萌宠日常', description='萌宠的治愈系日常', video_count=34500, views_count=23000000, cover='https://picsum.photos/seed/t5/400/300', heat=92000, created_at=now - 86400000 * 180),
-            Topic(id='t6', name='音乐分享', description='好音乐推荐与分享', video_count=15600, views_count=7800000, cover='https://picsum.photos/seed/t6/400/300', heat=54000, created_at=now - 86400000 * 150),
+            Topic(id='t1', name='美食探店', description='分享各地美食探店体验', video_count=12500, views_count=8900000, likes_count=450000, comments_count=89000, collects_count=67000, shares_count=34000, cover='https://picsum.photos/seed/t1/400/300', heat=98000, created_at=now - 86400000 * 300),
+            Topic(id='t2', name='旅行vlog', description='记录旅行中的美好时光', video_count=23400, views_count=15000000, likes_count=780000, comments_count=156000, collects_count=120000, shares_count=67000, cover='https://picsum.photos/seed/t2/400/300', heat=87000, created_at=now - 86400000 * 280),
+            Topic(id='t3', name='科技数码', description='最新科技产品评测分享', video_count=8900, views_count=6700000, likes_count=340000, comments_count=67000, collects_count=45000, shares_count=23000, cover='https://picsum.photos/seed/t3/400/300', heat=76000, created_at=now - 86400000 * 250),
+            Topic(id='t4', name='健身打卡', description='一起健身，打卡每一天', video_count=18700, views_count=9800000, likes_count=560000, comments_count=112000, collects_count=89000, shares_count=45000, cover='https://picsum.photos/seed/t4/400/300', heat=65000, created_at=now - 86400000 * 200),
+            Topic(id='t5', name='萌宠日常', description='萌宠的治愈系日常', video_count=34500, views_count=23000000, likes_count=1200000, comments_count=230000, collects_count=180000, shares_count=98000, cover='https://picsum.photos/seed/t5/400/300', heat=92000, created_at=now - 86400000 * 180),
+            Topic(id='t6', name='音乐分享', description='好音乐推荐与分享', video_count=15600, views_count=7800000, likes_count=390000, comments_count=78000, collects_count=56000, shares_count=34000, cover='https://picsum.photos/seed/t6/400/300', heat=54000, created_at=now - 86400000 * 150),
         ]
         for t in mock_topics:
             self.topics[t.id] = t
@@ -423,6 +436,27 @@ class Database:
                 status=VideoStatus.REMOVED,
                 created_at=now - 86400000 * (i + 5),
                 updated_at=now - 86400000 * (i + 2),
+            )
+            self.videos[vid] = video
+            self.video_topics[vid] = [f't{(i % 6) + 1}']
+
+        for i in range(4):
+            vid = f'v_rejected_{i+1}'
+            reject_reasons = ['内容质量不达标', '标题存在夸大宣传', '封面涉嫌违规', '版权问题']
+            video = Video(
+                id=vid, user_id=f'u{(i % 6) + 1}',
+                title=f'被驳回视频{i+1}',
+                description='审核未通过的视频',
+                cover_url=f'https://picsum.photos/seed/{vid}/720/1280',
+                video_url=f'https://example.com/videos/{vid}.mp4',
+                duration=25 + i * 8,
+                likes_count=0, comments_count=0, shares_count=0,
+                views_count=0, collects_count=0,
+                topics=[f't{(i % 6) + 1}'],
+                status=VideoStatus.REJECTED,
+                reject_reason=reject_reasons[i],
+                created_at=now - 86400000 * (i + 3),
+                updated_at=now - 86400000 * (i + 1),
             )
             self.videos[vid] = video
             self.video_topics[vid] = [f't{(i % 6) + 1}']

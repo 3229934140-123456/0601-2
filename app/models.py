@@ -8,6 +8,7 @@ class VideoStatus(str, Enum):
     REVIEWING = "reviewing"
     PUBLISHED = "published"
     REMOVED = "removed"
+    REJECTED = "rejected"
 
 
 class ReportStatus(str, Enum):
@@ -88,6 +89,7 @@ class Video:
     status: VideoStatus
     created_at: int
     updated_at: int
+    reject_reason: Optional[str] = None
 
     def to_dict(self):
         return {
@@ -107,6 +109,7 @@ class Video:
             "status": self.status,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            "rejectReason": self.reject_reason,
         }
 
 
@@ -196,6 +199,9 @@ class Draft:
     topics: List[str]
     updated_at: int
     history: List[DraftHistory] = field(default_factory=list)
+    file_size: int = 0
+    upload_task_id: Optional[str] = None
+    duration_unknown: bool = False
 
     def to_dict(self):
         return {
@@ -209,6 +215,9 @@ class Draft:
             "topics": self.topics,
             "updatedAt": self.updated_at,
             "historyCount": len(self.history),
+            "fileSize": self.file_size,
+            "uploadTaskId": self.upload_task_id,
+            "durationUnknown": self.duration_unknown,
         }
 
 
@@ -328,6 +337,10 @@ class Topic:
     description: str
     video_count: int
     views_count: int
+    likes_count: int
+    comments_count: int
+    collects_count: int
+    shares_count: int
     cover: str
     heat: int
     created_at: int
@@ -341,6 +354,10 @@ class Topic:
             "description": self.description,
             "videoCount": self.video_count,
             "viewsCount": self.views_count,
+            "likesCount": self.likes_count,
+            "commentsCount": self.comments_count,
+            "collectsCount": self.collects_count,
+            "sharesCount": self.shares_count,
             "cover": self.cover,
             "heat": self.heat,
             "createdAt": self.created_at,
