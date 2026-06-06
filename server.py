@@ -2,12 +2,16 @@ import json
 import re
 import time
 import uuid
+import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-from app.database import db, add_notification
-from app.models import Video, VideoStatus, Comment, Danmaku, Draft
-from app.models import UploadTask, Report, ReportStatus, NotificationType
+from app.database import db
+from app.models import (
+    Video, VideoStatus, Comment, Danmaku, Draft, DraftHistory,
+    UploadTask, UploadChunk, Report, ReportStatus,
+    NotificationType, Topic, TopicApply, UploadStatus, VideoStatsDaily
+)
 
 
 def success(data=None, message="success"):
@@ -27,6 +31,11 @@ def enrich_video(v, uid):
     likes = db.user_likes.get(uid, set())
     collects = db.user_collects.get(uid, set())
     follows = db.user_followings.get(uid, set())
+    topic_list = []
+    for tid in v.topics:
+        t = db.topics.get(tid)
+        if t:
+            topic_list.append(t.to_dict())
     return {
         **v.to_dict(),
         "author": {
@@ -34,10 +43,11 @@ def enrich_video(v, uid):
             "nickname": author.nickname if author else "未知用户",
             "avatar": author.avatar if author else "",
             "isVerified": author.is_verified if author else False,
-        },
+        } if author else None,
         "isLiked": v.id in likes,
         "isCollected": v.id in collects,
         "isFollowed": v.user_id in follows,
+        "topicList": topic_list,
     }
 
 
@@ -70,7 +80,7 @@ def handle_video(path, qp, uid, body=None, method="GET"):
     if method == "GET":
         if path == "/api/video/recommend":
             page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["10"])[0])
-            vs = sorted([v for v in db.videos.values() if v.status == "published"],
+            vs = sorted([v for v in db.videos.values() if v.status == VideoStatus.PUBLISHED],
                         key=lambda x: x.likes_count, reverse=True)
             s, e = (page - 1) * ps, page * ps
             return success({
@@ -81,7 +91,7 @@ def handle_video(path, qp, uid, body=None, method="GET"):
             page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["10"])[0])
             fs = db.user_followings.get(uid, set())
             vs = sorted([v for v in db.videos.values()
-                         if v.status == "published" and v.user_id in fs],
+                         if v.status == VideoStatus.PUBLISHED and v.user_id in fs],
                         key=lambda x: x.created_at, reverse=True)
             s, e = (page - 1) * ps, page * ps
             return success({
@@ -91,21 +101,34 @@ def handle_video(path, qp, uid, body=None, method="GET"):
         if path == "/api/video/hot/ranking":
             t = qp.get("type", ["hot"])[0]
             limit = int(qp.get("limit", ["20"])[0])
-            vs = [v for v in db.videos.values() if v.status == "published"]
+            vs = [v for v in db.videos.values() if v.status == VideoStatus.PUBLISHED]
             if t == "likes":
                 vs.sort(key=lambda x: x.likes_count, reverse=True)
             elif t == "new":
                 vs.sort(key=lambda x: x.created_at, reverse=True)
             else:
                 vs.sort(key=lambda x: x.views_count, reverse=True)
-            return success({
-                "type": t, "updateTime": int(time.time() * 1000),
-                "list": [enrich_video(v, uid) for v in vs[:limit]]
-            })
-        m = re.match(r"^/api/video/([^/]+)$", path)
+            vs = vs[:limit]
+            items = []
+            for i, v in enumerate(vs):
+                a = db.users.get(v.user_id)
+                items.append({
+                    "rank": i + 1,
+                    "id": v.id,
+                    "title": v.title,
+                    "coverUrl": v.cover_url,
+                    "duration": v.duration,
+                    "viewsCount": v.views_count,
+                    "likesCount": v.likes_count,
+                    "isLiked": v.id in db.user_likes.get(uid, set()),
+                    "author": {"id": a.id, "nickname": a.nickname, "avatar": a.avatar} if a else None
+                })
+            return success({"list": items, "updateTime": int(time.time() * 1000)})
+        m = re.match(r"/api/video/([\w-]+)$", path)
         if m:
-            v = db.videos.get(m.group(1))
-            if not v or v.status != "published":
+            vid = m.group(1)
+            v = db.videos.get(vid)
+            if not v or v.status == VideoStatus.REMOVED:
                 return error("视频不存在", 404)
             v.views_count += 1
             return success(enrich_video(v, uid))
@@ -113,124 +136,331 @@ def handle_video(path, qp, uid, body=None, method="GET"):
 
 
 def handle_publish(path, qp, uid, body=None, method="GET"):
-    if method == "GET":
-        if path == "/api/publish/drafts":
-            ds = sorted(db.drafts.get(uid, []), key=lambda d: d.updated_at, reverse=True)
-            return success({"list": [d.to_dict() for d in ds], "total": len(ds)})
-        if path == "/api/publish/topics/suggest":
-            kw = qp.get("keyword", [""])[0]
-            ts = list(db.topics.values())
-            if kw:
-                ts = [t for t in ts if kw.lower() in t.name.lower()]
-            ts.sort(key=lambda t: t.video_count, reverse=True)
-            return success({"list": [t.to_dict() for t in ts[:10]]})
-        m = re.match(r"^/api/publish/upload/([^/]+)/status$", path)
-        if m:
-            t = db.upload_tasks.get(m.group(1))
-            if not t:
-                return error("上传任务不存在", 404)
+    if path == "/api/publish/upload/init" and method == "POST":
+        file_name = body.get("fileName", "")
+        file_size = int(body.get("fileSize", 0))
+        if not file_name or file_size <= 0:
+            return error("文件名和文件大小不能为空", 400)
+        chunk_size = int(body.get("chunkSize", 5 * 1024 * 1024))
+        total_chunks = math.ceil(file_size / chunk_size)
+        chunks = []
+        for i in range(total_chunks):
+            size = chunk_size if i < total_chunks - 1 else file_size - (total_chunks - 1) * chunk_size
+            chunks.append(UploadChunk(chunk_index=i, size=size, uploaded=False, failed=False))
+        tid = str(uuid.uuid4())[:8]
+        task = UploadTask(
+            id=tid, user_id=uid, file_name=file_name, file_size=file_size,
+            uploaded_size=0, status=UploadStatus.INIT, video_url=None,
+            chunk_size=chunk_size, total_chunks=total_chunks, chunks=chunks,
+            created_at=int(time.time() * 1000), updated_at=int(time.time() * 1000)
+        )
+        db.upload_tasks[tid] = task
+        return success(task.to_dict(), "上传任务创建成功")
+
+    m = re.match(r"/api/publish/upload/([\w-]+)/chunk$", path)
+    if m and method == "POST":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限操作此任务", 403)
+        if task.status == UploadStatus.CANCELLED:
+            return error("上传任务已取消", 400)
+        chunk_index = int(body.get("chunkIndex", 0))
+        if chunk_index < 0 or chunk_index >= task.total_chunks:
+            return error("分片索引无效", 400)
+        chunk = task.chunks[chunk_index]
+        chunk.uploaded = True
+        chunk.failed = False
+        task.uploaded_size = sum(c.size for c in task.chunks if c.uploaded)
+        task.status = UploadStatus.UPLOADING
+        task.updated_at = int(time.time() * 1000)
+        uploaded_count = sum(1 for c in task.chunks if c.uploaded)
+        return success({
+            "chunkIndex": chunk_index,
+            "uploaded": True,
+            "uploadedChunks": uploaded_count,
+            "totalChunks": task.total_chunks,
+            "progress": int(uploaded_count / task.total_chunks * 100)
+        }, "分片上传成功")
+
+    m = re.match(r"/api/publish/upload/([\w-]+)/chunk/retry$", path)
+    if m and method == "POST":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限操作此任务", 403)
+        chunk_index = int(body.get("chunkIndex", 0))
+        if chunk_index < 0 or chunk_index >= task.total_chunks:
+            return error("分片索引无效", 400)
+        chunk = task.chunks[chunk_index]
+        chunk.uploaded = False
+        chunk.failed = True
+        task.updated_at = int(time.time() * 1000)
+        return success({"chunkIndex": chunk_index, "failed": True}, "分片标记为失败，可重新上传")
+
+    m = re.match(r"/api/publish/upload/([\w-]+)/status$", path)
+    if m and method == "GET":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限查看此任务", 403)
+        data = task.to_dict()
+        data["chunks"] = [c.to_dict() for c in task.chunks]
+        return success(data)
+
+    m = re.match(r"/api/publish/upload/([\w-]+)/cancel$", path)
+    if m and method == "POST":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限操作此任务", 403)
+        task.status = UploadStatus.CANCELLED
+        task.updated_at = int(time.time() * 1000)
+        return success(task.to_dict(), "上传已取消")
+
+    m = re.match(r"/api/publish/upload/([\w-]+)/complete$", path)
+    if m and method == "POST":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限操作此任务", 403)
+        failed_chunks = [c.chunk_index for c in task.chunks if not c.uploaded]
+        if failed_chunks:
             return success({
-                "taskId": t.id, "status": t.status,
-                "uploadedSize": t.uploaded_size, "fileSize": t.file_size,
-                "progress": int(t.uploaded_size / t.file_size * 100),
-                "videoUrl": t.video_url
-            })
-        m = re.match(r"^/api/publish/video/([^/]+)/status$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            r = {"videoId": v.id, "status": v.status, "title": v.title, "createdAt": v.created_at}
-            if v.status == VideoStatus.REMOVED:
-                r["rejectReason"] = "内容不符合平台规范"
-            return success(r)
-    if method == "POST":
-        if path == "/api/publish/upload/init":
-            tid = str(uuid.uuid4())
-            t = UploadTask(id=tid, user_id=uid, file_name=body.get("fileName", ""),
-                           file_size=body.get("fileSize", 0), uploaded_size=0,
-                           status="uploading", created_at=int(time.time() * 1000))
-            db.upload_tasks[tid] = t
-            return success({"taskId": tid, "uploadUrl": f"/api/publish/upload/{tid}"})
-        if path == "/api/publish/drafts":
-            did = str(uuid.uuid4())
-            d = Draft(id=did, user_id=uid, title=body.get("title", ""),
-                      description=body.get("description", ""),
-                      cover_url=body.get("coverUrl", ""),
-                      video_url=body.get("videoUrl", ""),
-                      duration=body.get("duration", 0),
-                      topics=body.get("topics", []),
-                      updated_at=int(time.time() * 1000))
+                "completed": False,
+                "failedChunks": failed_chunks,
+                "message": "存在未上传或失败的分片"
+            }, "上传未完成")
+        task.status = UploadStatus.COMPLETED
+        task.video_url = f"https://example.com/uploads/{tid}.mp4"
+        task.updated_at = int(time.time() * 1000)
+        data = task.to_dict()
+        return success({"completed": True, "videoUrl": task.video_url, "task": data}, "上传完成")
+
+    if path == "/api/publish/upload/list" and method == "GET":
+        tasks = [t for t in db.upload_tasks.values() if t.user_id == uid]
+        tasks.sort(key=lambda x: x.created_at, reverse=True)
+        return success({"list": [t.to_dict() for t in tasks], "total": len(tasks)})
+
+    if path == "/api/publish/video" and method == "POST":
+        title = body.get("title", "").strip()
+        video_url = body.get("videoUrl", "").strip()
+        cover_url = body.get("coverUrl", "").strip()
+        duration = int(body.get("duration", 0))
+        description = body.get("description", "")
+        topic_ids = body.get("topics", []) or []
+        if not title:
+            return error("标题不能为空", 400)
+        if len(title) > 100:
+            return error("标题不能超过100字", 400)
+        if not video_url:
+            return error("视频地址不能为空", 400)
+        if not cover_url:
+            return error("封面不能为空", 400)
+        if duration <= 0:
+            return error("视频时长无效", 400)
+        if len(topic_ids) > 5:
+            return error("最多绑定5个话题", 400)
+        valid_topics = []
+        for tid in topic_ids:
+            if tid in db.topics:
+                valid_topics.append(tid)
+        vid = str(uuid.uuid4())[:8]
+        now = int(time.time() * 1000)
+        video = Video(
+            id=vid, user_id=uid, title=title, description=description,
+            cover_url=cover_url, video_url=video_url, duration=duration,
+            likes_count=0, comments_count=0, shares_count=0, views_count=0,
+            collects_count=0, topics=valid_topics, status=VideoStatus.REVIEWING,
+            created_at=now, updated_at=now
+        )
+        db.videos[vid] = video
+        db.video_topics[vid] = valid_topics
+        user = db.users.get(uid)
+        if user:
+            user.works_count += 1
+        db.add_notification(uid, NotificationType.AUDIT, "视频审核中",
+                            f'你的视频"{title}"已提交审核',
+                            related_id=vid, related_type="video")
+        return success({"videoId": vid, "status": VideoStatus.REVIEWING}, "发布成功，正在审核中")
+
+    if path == "/api/publish/drafts" and method == "GET":
+        drafts = db.drafts.get(uid, [])
+        drafts.sort(key=lambda x: x.updated_at, reverse=True)
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        s, e = (page - 1) * ps, page * ps
+        return success({
+            "list": [d.to_dict() for d in drafts[s:e]],
+            "total": len(drafts), "page": page, "pageSize": ps,
+            "hasMore": e < len(drafts)
+        })
+
+    if path == "/api/publish/drafts/save" and method == "POST":
+        draft_id = body.get("draftId")
+        title = body.get("title", "")
+        description = body.get("description", "")
+        cover_url = body.get("coverUrl", "")
+        video_url = body.get("videoUrl", "")
+        duration = int(body.get("duration", 0))
+        topics = body.get("topics", []) or []
+        now = int(time.time() * 1000)
+        user_drafts = db.drafts.get(uid, [])
+        if draft_id:
+            draft = next((d for d in user_drafts if d.id == draft_id), None)
+            if not draft:
+                return error("草稿不存在", 404)
+            if len(draft.history) < 10:
+                history = DraftHistory(
+                    version=len(draft.history) + 1,
+                    title=draft.title, description=draft.description,
+                    cover_url=draft.cover_url, video_url=draft.video_url,
+                    duration=draft.duration, topics=draft.topics[:],
+                    updated_at=draft.updated_at
+                )
+                draft.history.append(history)
+            else:
+                for i in range(9):
+                    draft.history[i] = draft.history[i + 1]
+                history = DraftHistory(
+                    version=len(draft.history) + 1,
+                    title=draft.title, description=draft.description,
+                    cover_url=draft.cover_url, video_url=draft.video_url,
+                    duration=draft.duration, topics=draft.topics[:],
+                    updated_at=draft.updated_at
+                )
+                draft.history[9] = history
+            draft.title = title
+            draft.description = description
+            draft.cover_url = cover_url
+            draft.video_url = video_url
+            draft.duration = duration
+            draft.topics = topics
+            draft.updated_at = now
+            return success({"draftId": draft.id, **draft.to_dict()}, "草稿保存成功")
+        else:
+            did = str(uuid.uuid4())[:8]
+            draft = Draft(
+                id=did, user_id=uid, title=title, description=description,
+                cover_url=cover_url, video_url=video_url, duration=duration,
+                topics=topics, updated_at=now, history=[]
+            )
             if uid not in db.drafts:
                 db.drafts[uid] = []
-            db.drafts[uid].append(d)
-            return success({"draftId": did, **d.to_dict()}, "草稿保存成功")
-        if path == "/api/publish/cover/select":
-            url = f"https://picsum.photos/seed/{int(time.time())}/720/1280"
-            frames = [{"index": i, "timestamp": i * 5,
-                       "thumbnailUrl": f"https://picsum.photos/seed/frame{i}/180/320"}
-                      for i in range(5)]
-            return success({"selectedCover": url, "frames": frames}, "封面生成成功")
-        if path == "/api/publish/video":
-            vid = str(uuid.uuid4())
-            now = int(time.time() * 1000)
-            v = Video(id=vid, user_id=uid, title=body.get("title", ""),
-                      description=body.get("description", ""),
-                      cover_url=body.get("coverUrl", ""),
-                      video_url=body.get("videoUrl", ""),
-                      duration=body.get("duration", 0),
-                      likes_count=0, comments_count=0, shares_count=0,
-                      views_count=0, collects_count=0,
-                      topics=body.get("topics", []), status=VideoStatus.REVIEWING,
-                      created_at=now, updated_at=now)
-            db.videos[vid] = v
-            if body.get("draftId"):
-                db.drafts[uid] = [d for d in db.drafts.get(uid, [])
-                                  if d.id != body["draftId"]]
-            u = db.users.get(uid)
-            if u:
-                u.works_count += 1
-            for tid in body.get("topics", []):
-                tp = db.topics.get(tid)
-                if tp:
-                    tp.video_count += 1
-            return success({"videoId": vid, "status": "reviewing",
-                            "estimatedTime": "预计10分钟内完成审核"},
-                           "视频提交成功，正在审核中")
-        m = re.match(r"^/api/publish/upload/([^/]+)/chunk$", path)
-        if m:
-            t = db.upload_tasks.get(m.group(1))
-            if not t:
-                return error("上传任务不存在", 404)
-            t.uploaded_size += body.get("chunkSize", 1024 * 1024)
-            if t.uploaded_size >= t.file_size:
-                t.status = "success"
-                t.video_url = f"https://example.com/videos/{t.id}.mp4"
-            return success({"taskId": t.id, "uploadedSize": t.uploaded_size,
-                            "progress": int(t.uploaded_size / t.file_size * 100)})
-    if method == "PUT":
-        m = re.match(r"^/api/publish/drafts/([^/]+)$", path)
-        if m:
-            ds = db.drafts.get(uid, [])
-            d = next((x for x in ds if x.id == m.group(1)), None)
-            if not d:
-                return error("草稿不存在", 404)
-            for k, ak in [("title", "title"), ("description", "description"),
-                          ("coverUrl", "cover_url"), ("videoUrl", "video_url"),
-                          ("duration", "duration"), ("topics", "topics")]:
-                if k in body:
-                    setattr(d, ak, body[k])
-            d.updated_at = int(time.time() * 1000)
-            return success(d.to_dict(), "草稿更新成功")
-    if method == "DELETE":
-        m = re.match(r"^/api/publish/drafts/([^/]+)$", path)
-        if m:
-            ds = db.drafts.get(uid, [])
-            fd = [d for d in ds if d.id != m.group(1)]
-            if len(fd) == len(ds):
-                return error("草稿不存在", 404)
-            db.drafts[uid] = fd
-            return success(None, "草稿删除成功")
+            db.drafts[uid].append(draft)
+            return success({"draftId": did, **draft.to_dict()}, "草稿创建成功")
+
+    m = re.match(r"/api/publish/drafts/([\w-]+)$", path)
+    if m and method == "GET":
+        did = m.group(1)
+        drafts = db.drafts.get(uid, [])
+        draft = next((d for d in drafts if d.id == did), None)
+        if not draft:
+            return error("草稿不存在", 404)
+        data = draft.to_dict()
+        data["history"] = [h.to_dict() for h in reversed(draft.history)]
+        return success(data)
+
+    if m and method == "DELETE":
+        did = m.group(1)
+        drafts = db.drafts.get(uid, [])
+        draft = next((d for d in drafts if d.id == did), None)
+        if not draft:
+            return error("草稿不存在", 404)
+        db.drafts[uid] = [d for d in drafts if d.id != did]
+        return success(None, "草稿删除成功")
+
+    m = re.match(r"/api/publish/drafts/([\w-]+)/restore$", path)
+    if m and method == "POST":
+        did = m.group(1)
+        version = int(body.get("version", 0))
+        drafts = db.drafts.get(uid, [])
+        draft = next((d for d in drafts if d.id == did), None)
+        if not draft:
+            return error("草稿不存在", 404)
+        history = next((h for h in draft.history if h.version == version), None)
+        if not history:
+            return error("历史版本不存在", 404)
+        h = DraftHistory(
+            version=len(draft.history) + 1,
+            title=draft.title, description=draft.description,
+            cover_url=draft.cover_url, video_url=draft.video_url,
+            duration=draft.duration, topics=draft.topics[:],
+            updated_at=draft.updated_at
+        )
+        draft.history.append(h)
+        draft.title = history.title
+        draft.description = history.description
+        draft.cover_url = history.cover_url
+        draft.video_url = history.video_url
+        draft.duration = history.duration
+        draft.topics = history.topics[:]
+        draft.updated_at = int(time.time() * 1000)
+        return success(draft.to_dict(), "恢复成功")
+
+    m = re.match(r"/api/publish/drafts/from-video/([\w-]+)$", path)
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v:
+            return error("视频不存在", 404)
+        if v.user_id != uid:
+            return error("无权限操作", 403)
+        did = str(uuid.uuid4())[:8]
+        now = int(time.time() * 1000)
+        draft = Draft(
+            id=did, user_id=uid, title=v.title, description=v.description,
+            cover_url=v.cover_url, video_url=v.video_url, duration=v.duration,
+            topics=v.topics[:], updated_at=now, history=[]
+        )
+        if uid not in db.drafts:
+            db.drafts[uid] = []
+        db.drafts[uid].append(draft)
+        return success({"draftId": did, **draft.to_dict()}, "已保存为草稿")
+
+    if path == "/api/publish/topics/suggest" and method == "GET":
+        kw = qp.get("keyword", [""])[0]
+        kwl = kw.lower()
+        sort = qp.get("sort", ["heat"])[0]
+        ts = list(db.topics.values())
+        if kwl:
+            ts = [t for t in ts if kwl in t.name.lower() or kwl in t.description.lower()]
+        if sort == "videoCount":
+            ts.sort(key=lambda x: x.video_count, reverse=True)
+        elif sort == "views":
+            ts.sort(key=lambda x: x.views_count, reverse=True)
+        else:
+            ts.sort(key=lambda x: x.heat, reverse=True)
+        return success({"list": [t.to_dict() for t in ts[:10]], "total": len(ts)})
+
+    if path == "/api/publish/topics/apply" and method == "POST":
+        name = body.get("name", "").strip()
+        description = body.get("description", "").strip()
+        if not name:
+            return error("话题名称不能为空", 400)
+        if len(name) > 20:
+            return error("话题名称不能超过20字", 400)
+        for t in db.topics.values():
+            if t.name == name:
+                return error("话题已存在", 400)
+        aid = str(uuid.uuid4())[:8]
+        apply = TopicApply(
+            id=aid, user_id=uid, name=name, description=description,
+            status="pending", created_at=int(time.time() * 1000), reject_reason=None
+        )
+        db.topic_applies[aid] = apply
+        return success({"applyId": aid, "status": "pending"}, "申请已提交，等待审核")
+
     return None
 
 
@@ -240,237 +470,341 @@ def handle_account(path, qp, uid, body=None, method="GET"):
             u = db.users.get(uid)
             if not u:
                 return error("用户不存在", 404)
-            return success(u.to_dict())
-        m = re.match(r"^/api/account/([^/]+)$", path)
+            return success(enrich_user(u, uid))
+        m = re.match(r"/api/account/([\w-]+)$", path)
         if m:
-            u = db.users.get(m.group(1))
+            uid2 = m.group(1)
+            u = db.users.get(uid2)
             if not u:
                 return error("用户不存在", 404)
             return success(enrich_user(u, uid))
-        m = re.match(r"^/api/account/([^/]+)/videos$", path)
+        m = re.match(r"/api/account/([\w-]+)/videos$", path)
         if m:
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
+            uid2 = m.group(1)
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["10"])[0])
             vs = sorted([v for v in db.videos.values()
-                         if v.user_id == m.group(1) and v.status == "published"],
+                         if v.user_id == uid2 and v.status == VideoStatus.PUBLISHED],
                         key=lambda x: x.created_at, reverse=True)
             s, e = (page - 1) * ps, page * ps
             return success({
-                "list": [{"id": v.id, "title": v.title, "coverUrl": v.cover_url,
-                          "duration": v.duration, "likesCount": v.likes_count,
-                          "viewsCount": v.views_count, "createdAt": v.created_at}
-                         for v in vs[s:e]],
+                "list": [enrich_video(v, uid) for v in vs[s:e]],
                 "total": len(vs), "page": page, "pageSize": ps, "hasMore": e < len(vs)
             })
-        m = re.match(r"^/api/account/([^/]+)/likes$", path)
+        m = re.match(r"/api/account/([\w-]+)/likes$", path)
         if m:
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-            liked = db.user_likes.get(m.group(1), set())
+            uid2 = m.group(1)
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["10"])[0])
+            liked = db.user_likes.get(uid2, set())
             vs = sorted([v for v in db.videos.values()
-                         if v.id in liked and v.status == "published"],
+                         if v.id in liked and v.status == VideoStatus.PUBLISHED],
                         key=lambda x: x.created_at, reverse=True)
             s, e = (page - 1) * ps, page * ps
             return success({
-                "list": [{"id": v.id, "title": v.title, "coverUrl": v.cover_url,
-                          "duration": v.duration, "likesCount": v.likes_count,
-                          "viewsCount": v.views_count} for v in vs[s:e]],
+                "list": [enrich_video(v, uid) for v in vs[s:e]],
                 "total": len(vs), "page": page, "pageSize": ps, "hasMore": e < len(vs)
             })
-        m = re.match(r"^/api/account/([^/]+)/collects$", path)
+        m = re.match(r"/api/account/([\w-]+)/collects$", path)
         if m:
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-            col = db.user_collects.get(m.group(1), set())
+            uid2 = m.group(1)
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["10"])[0])
+            cols = db.user_collects.get(uid2, set())
             vs = sorted([v for v in db.videos.values()
-                         if v.id in col and v.status == "published"],
+                         if v.id in cols and v.status == VideoStatus.PUBLISHED],
                         key=lambda x: x.created_at, reverse=True)
             s, e = (page - 1) * ps, page * ps
             return success({
-                "list": [{"id": v.id, "title": v.title, "coverUrl": v.cover_url,
-                          "duration": v.duration, "likesCount": v.likes_count,
-                          "viewsCount": v.views_count} for v in vs[s:e]],
+                "list": [enrich_video(v, uid) for v in vs[s:e]],
                 "total": len(vs), "page": page, "pageSize": ps, "hasMore": e < len(vs)
             })
-        for sub in ["following", "followers"]:
-            m = re.match(rf"^/api/account/([^/]+)/{sub}$", path)
-            if m:
-                page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-                s2 = db.user_followings.get(m.group(1), set()) if sub == "following" \
-                    else db.user_followers.get(m.group(1), set())
-                us = sorted([db.users[x] for x in s2 if x in db.users],
-                            key=lambda x: x.followers_count, reverse=True)
-                s, e = (page - 1) * ps, page * ps
-                return success({
-                    "list": [enrich_user(u, uid) for u in us[s:e]],
-                    "total": len(us), "page": page, "pageSize": ps, "hasMore": e < len(us)
-                })
-    if method == "PUT":
-        if path == "/api/account/profile":
-            u = db.users.get(uid)
-            if not u:
-                return error("用户不存在", 404)
-            for k in ["nickname", "avatar", "bio"]:
-                if k in body:
-                    setattr(u, k, body[k])
-            return success(u.to_dict(), "资料更新成功")
+        m = re.match(r"/api/account/([\w-]+)/following$", path)
+        if m:
+            uid2 = m.group(1)
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["10"])[0])
+            fids = list(db.user_followings.get(uid2, set()))
+            users = [enrich_user(db.users[fid], uid) for fid in fids if fid in db.users]
+            users.sort(key=lambda x: x["followersCount"], reverse=True)
+            s, e = (page - 1) * ps, page * ps
+            return success({
+                "list": users[s:e], "total": len(users),
+                "page": page, "pageSize": ps, "hasMore": e < len(users)
+            })
+        m = re.match(r"/api/account/([\w-]+)/followers$", path)
+        if m:
+            uid2 = m.group(1)
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["10"])[0])
+            fids = list(db.user_followers.get(uid2, set()))
+            users = [enrich_user(db.users[fid], uid) for fid in fids if fid in db.users]
+            users.sort(key=lambda x: x["followersCount"], reverse=True)
+            s, e = (page - 1) * ps, page * ps
+            return success({
+                "list": users[s:e], "total": len(users),
+                "page": page, "pageSize": ps, "hasMore": e < len(users)
+            })
+    if method == "PUT" and path == "/api/account/profile":
+        u = db.users.get(uid)
+        if not u:
+            return error("用户不存在", 404)
+        nickname = body.get("nickname")
+        bio = body.get("bio")
+        avatar = body.get("avatar")
+        if nickname:
+            u.nickname = nickname
+        if bio is not None:
+            u.bio = bio
+        if avatar:
+            u.avatar = avatar
+        return success(u.to_dict(), "资料更新成功")
     return None
 
 
 def handle_interaction(path, qp, uid, body=None, method="GET"):
-    if method == "GET":
-        m = re.match(r"^/api/interaction/video/([^/]+)/comments$", path)
-        if m:
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-            cids = db.video_comments.get(m.group(1), [])
-            cs = sorted([db.comments[c] for c in cids
-                         if c in db.comments and db.comments[c].parent_id is None],
-                        key=lambda x: x.created_at, reverse=True)
-            s, e = (page - 1) * ps, page * ps
-            return success({
-                "list": [enrich_comment(c, uid) for c in cs[s:e]],
-                "total": len(cs), "page": page, "pageSize": ps, "hasMore": e < len(cs)
-            })
-        m = re.match(r"^/api/interaction/comment/([^/]+)/replies$", path)
-        if m:
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-            cs = sorted([c for c in db.comments.values() if c.parent_id == m.group(1)],
-                        key=lambda x: x.created_at)
-            s, e = (page - 1) * ps, page * ps
-            return success({
-                "list": [enrich_comment(c, uid) for c in cs[s:e]],
-                "total": len(cs), "page": page, "pageSize": ps, "hasMore": e < len(cs)
-            })
-        m = re.match(r"^/api/interaction/video/([^/]+)/danmakus$", path)
-        if m:
-            ds = db.danmakus.get(m.group(1), [])
-            return success({"list": [d.to_dict() for d in ds]})
-    if method == "POST":
-        m = re.match(r"^/api/interaction/video/([^/]+)/like$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            ls = db.user_likes.get(uid, set())
-            liked = v.id in ls
-            if liked:
-                ls.discard(v.id)
-                v.likes_count = max(0, v.likes_count - 1)
-            else:
-                ls.add(v.id)
-                v.likes_count += 1
-                if v.user_id != uid:
-                    cu = db.users.get(uid)
-                    add_notification(v.user_id, NotificationType.LIKE,
-                                     f"{cu.nickname if cu else '有人'} 赞了你的视频", v.id)
-            db.user_likes[uid] = ls
-            return success({"isLiked": not liked, "likesCount": v.likes_count})
-        m = re.match(r"^/api/interaction/video/([^/]+)/collect$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            cs = db.user_collects.get(uid, set())
-            col = v.id in cs
-            if col:
-                cs.discard(v.id)
-                v.collects_count = max(0, v.collects_count - 1)
-            else:
-                cs.add(v.id)
-                v.collects_count += 1
-            db.user_collects[uid] = cs
-            return success({"isCollected": not col, "collectsCount": v.collects_count})
-        m = re.match(r"^/api/interaction/video/([^/]+)/share$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            v.shares_count += 1
-            return success({"sharesCount": v.shares_count,
-                            "shareUrl": f"https://example.com/video/{v.id}"})
-        m = re.match(r"^/api/interaction/video/([^/]+)/comments$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            cid = str(uuid.uuid4())
-            c = Comment(id=cid, video_id=m.group(1), user_id=uid,
-                        content=body.get("content", ""), likes_count=0,
-                        reply_count=0, parent_id=body.get("parentId"),
-                        created_at=int(time.time() * 1000))
-            db.comments[cid] = c
-            db.comment_likes[cid] = set()
-            if m.group(1) not in db.video_comments:
-                db.video_comments[m.group(1)] = []
-            db.video_comments[m.group(1)].append(cid)
-            v.comments_count += 1
-            if body.get("parentId"):
-                pc = db.comments.get(body["parentId"])
-                if pc:
-                    pc.reply_count += 1
-            if v.user_id != uid and not body.get("parentId"):
-                cu = db.users.get(uid)
-                add_notification(v.user_id, NotificationType.COMMENT,
-                                 f"{cu.nickname if cu else '有人'} 评论了你的视频：{body.get('content', '')[:20]}",
-                                 v.id)
-            return success(enrich_comment(c, uid), "评论成功")
-        m = re.match(r"^/api/interaction/comment/([^/]+)/like$", path)
-        if m:
-            c = db.comments.get(m.group(1))
-            if not c:
-                return error("评论不存在", 404)
-            ls = db.comment_likes.get(m.group(1), set())
-            liked = uid in ls
-            if liked:
-                ls.discard(uid)
-                c.likes_count = max(0, c.likes_count - 1)
-            else:
-                ls.add(uid)
-                c.likes_count += 1
-            db.comment_likes[m.group(1)] = ls
-            return success({"isLiked": not liked, "likesCount": c.likes_count})
-        m = re.match(r"^/api/interaction/video/([^/]+)/danmakus$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v:
-                return error("视频不存在", 404)
-            d = Danmaku(id=str(uuid.uuid4()), video_id=m.group(1), user_id=uid,
-                        content=body.get("content", ""),
-                        timestamp=body.get("timestamp", 0),
-                        color=body.get("color", "#ffffff"),
-                        created_at=int(time.time() * 1000))
-            if m.group(1) not in db.danmakus:
-                db.danmakus[m.group(1)] = []
-            db.danmakus[m.group(1)].append(d)
-            return success(d.to_dict(), "弹幕发送成功")
-        m = re.match(r"^/api/interaction/user/([^/]+)/follow$", path)
-        if m:
-            tid = m.group(1)
-            if tid == uid:
-                return error("不能关注自己", 400)
-            tu = db.users.get(tid)
-            if not tu:
-                return error("用户不存在", 404)
-            fs = db.user_followings.get(uid, set())
-            fss = db.user_followers.get(tid, set())
-            f = tid in fs
-            if f:
-                fs.discard(tid)
-                fss.discard(uid)
-                tu.followers_count = max(0, tu.followers_count - 1)
-                cu = db.users.get(uid)
-                if cu:
-                    cu.following_count = max(0, cu.following_count - 1)
-            else:
-                fs.add(tid)
-                fss.add(uid)
-                tu.followers_count += 1
-                cu = db.users.get(uid)
-                if cu:
-                    cu.following_count += 1
-                cu2 = db.users.get(uid)
-                add_notification(tid, NotificationType.FOLLOW,
-                                 f"{cu2.nickname if cu2 else '有人'} 关注了你", uid)
-            db.user_followings[uid] = fs
-            db.user_followers[tid] = fss
-            return success({"isFollowed": not f, "followersCount": tu.followers_count})
+    m = re.match(r"/api/interaction/video/([\w-]+)/like$", path)
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v or v.status == VideoStatus.REMOVED:
+            return error("视频不存在", 404)
+        likes = db.user_likes.get(uid, set())
+        if vid in likes:
+            likes.remove(vid)
+            v.likes_count = max(0, v.likes_count - 1)
+            liked = False
+        else:
+            likes.add(vid)
+            v.likes_count += 1
+            liked = True
+            if v.user_id != uid:
+                user = db.users.get(uid)
+                db.add_notification(v.user_id, NotificationType.LIKE, "收到新点赞",
+                                    f'{user.nickname if user else "有人"} 赞了你的视频',
+                                    related_id=vid, related_type="video",
+                                    extra={"fromUserId": uid})
+        db.user_likes[uid] = likes
+        author = db.users.get(v.user_id)
+        if author:
+            author.likes_count = sum(x.likes_count for x in db.videos.values() if x.user_id == v.user_id)
+        return success({"isLiked": liked, "likesCount": v.likes_count})
+
+    m = re.match(r"/api/interaction/video/([\w-]+)/collect$", path)
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v or v.status == VideoStatus.REMOVED:
+            return error("视频不存在", 404)
+        cols = db.user_collects.get(uid, set())
+        if vid in cols:
+            cols.remove(vid)
+            v.collects_count = max(0, v.collects_count - 1)
+            collected = False
+        else:
+            cols.add(vid)
+            v.collects_count += 1
+            collected = True
+        db.user_collects[uid] = cols
+        return success({"isCollected": collected, "collectsCount": v.collects_count})
+
+    m = re.match(r"/api/interaction/video/([\w-]+)/share$", path)
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v or v.status == VideoStatus.REMOVED:
+            return error("视频不存在", 404)
+        v.shares_count += 1
+        return success({"sharesCount": v.shares_count})
+
+    m = re.match(r"/api/interaction/video/([\w-]+)/comments$", path)
+    if m and method == "GET":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v:
+            return error("视频不存在", 404)
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        sort = qp.get("sort", ["hot"])[0]
+        all_cids = db.video_comments.get(vid, [])
+        cs = [db.comments[cid] for cid in all_cids if cid in db.comments]
+        cs = [c for c in cs if c.parent_id is None and not c.is_deleted]
+        if sort == "new":
+            cs.sort(key=lambda x: x.created_at, reverse=True)
+        else:
+            cs.sort(key=lambda x: x.likes_count, reverse=True)
+        s, e = (page - 1) * ps, page * ps
+        items = []
+        for c in cs[s:e]:
+            item = enrich_comment(c, uid)
+            reply_cids = [cid for cid in all_cids if cid in db.comments
+                          and db.comments[cid].root_id == c.id
+                          and not db.comments[cid].is_deleted]
+            replies = [db.comments[cid] for cid in reply_cids[:3]]
+            item["replies"] = [enrich_comment(r, uid) for r in replies]
+            item["repliesTotal"] = len(reply_cids)
+            items.append(item)
+        return success({
+            "list": items, "total": len(cs),
+            "page": page, "pageSize": ps, "hasMore": e < len(cs)
+        })
+
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v:
+            return error("视频不存在", 404)
+        content = body.get("content", "").strip()
+        if not content:
+            return error("评论内容不能为空", 400)
+        if len(content) > 500:
+            return error("评论内容不能超过500字", 400)
+        cid = str(uuid.uuid4())[:8]
+        parent_id = body.get("parentId")
+        root_id = body.get("rootId")
+        parent = None
+        if parent_id and parent_id in db.comments:
+            parent = db.comments[parent_id]
+            if not root_id:
+                root_id = parent.root_id if parent.root_id else parent.id
+        c = Comment(
+            id=cid, video_id=vid, user_id=uid, content=content,
+            likes_count=0, reply_count=0,
+            parent_id=parent_id, root_id=root_id,
+            created_at=int(time.time() * 1000), is_deleted=False
+        )
+        db.comments[cid] = c
+        db.comment_likes[cid] = set()
+        if vid not in db.video_comments:
+            db.video_comments[vid] = []
+        db.video_comments[vid].append(cid)
+        v.comments_count += 1
+        if parent:
+            parent.reply_count += 1
+        if v.user_id != uid:
+            user = db.users.get(uid)
+            db.add_notification(v.user_id, NotificationType.COMMENT, "收到新评论",
+                                f'{user.nickname if user else "有人"} 评论了你的视频：{content[:30]}',
+                                related_id=vid, related_type="video",
+                                extra={"commentId": cid})
+        return success(enrich_comment(c, uid), "评论成功")
+
+    m = re.match(r"/api/interaction/comments/([\w-]+)/like$", path)
+    if m and method == "POST":
+        cid = m.group(1)
+        c = db.comments.get(cid)
+        if not c or c.is_deleted:
+            return error("评论不存在", 404)
+        liked_set = db.comment_likes.get(cid, set())
+        if uid in liked_set:
+            liked_set.remove(uid)
+            c.likes_count = max(0, c.likes_count - 1)
+            liked = False
+        else:
+            liked_set.add(uid)
+            c.likes_count += 1
+            liked = True
+        db.comment_likes[cid] = liked_set
+        return success({"isLiked": liked, "likesCount": c.likes_count})
+
+    m = re.match(r"/api/interaction/comments/([\w-]+)$", path)
+    if m and method == "DELETE":
+        cid = m.group(1)
+        c = db.comments.get(cid)
+        if not c:
+            return error("评论不存在", 404)
+        if c.user_id != uid:
+            return error("无权限删除此评论", 403)
+        c.is_deleted = True
+        v = db.videos.get(c.video_id)
+        if v:
+            v.comments_count = max(0, v.comments_count - 1)
+        return success(None, "评论删除成功")
+
+    m = re.match(r"/api/interaction/comments/([\w-]+)/replies$", path)
+    if m and method == "GET":
+        cid = m.group(1)
+        c = db.comments.get(cid)
+        if not c:
+            return error("评论不存在", 404)
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        root_id = c.root_id if c.root_id else c.id
+        all_cids = db.video_comments.get(c.video_id, [])
+        replies = [db.comments[rcid] for rcid in all_cids
+                   if rcid in db.comments
+                   and db.comments[rcid].root_id == root_id
+                   and db.comments[rcid].parent_id == root_id
+                   and not db.comments[rcid].is_deleted
+                   and rcid != root_id]
+        replies.sort(key=lambda x: x.created_at)
+        s, e = (page - 1) * ps, page * ps
+        items = [enrich_comment(r, uid) for r in replies[s:e]]
+        return success({
+            "list": items, "total": len(replies),
+            "page": page, "pageSize": ps, "hasMore": e < len(replies)
+        })
+
+    m = re.match(r"/api/interaction/video/([\w-]+)/danmakus$", path)
+    if m and method == "GET":
+        vid = m.group(1)
+        dms = db.danmakus.get(vid, [])
+        return success({"list": [d.to_dict() for d in dms]})
+    if m and method == "POST":
+        vid = m.group(1)
+        v = db.videos.get(vid)
+        if not v:
+            return error("视频不存在", 404)
+        content = body.get("content", "").strip()
+        timestamp = float(body.get("timestamp", 0))
+        color = body.get("color", "#ffffff")
+        if not content:
+            return error("弹幕内容不能为空", 400)
+        did = str(uuid.uuid4())[:8]
+        dm = Danmaku(
+            id=did, video_id=vid, user_id=uid, content=content,
+            timestamp=timestamp, color=color,
+            created_at=int(time.time() * 1000)
+        )
+        if vid not in db.danmakus:
+            db.danmakus[vid] = []
+        db.danmakus[vid].append(dm)
+        return success(dm.to_dict(), "弹幕发送成功")
+
+    m = re.match(r"/api/interaction/user/([\w-]+)/follow$", path)
+    if m and method == "POST":
+        target_uid = m.group(1)
+        if target_uid == uid:
+            return error("不能关注自己", 400)
+        target = db.users.get(target_uid)
+        if not target:
+            return error("用户不存在", 404)
+        followings = db.user_followings.get(uid, set())
+        followers = db.user_followers.get(target_uid, set())
+        if target_uid in followings:
+            followings.remove(target_uid)
+            followers.discard(uid)
+            followed = False
+            target.followers_count = max(0, target.followers_count - 1)
+            me = db.users.get(uid)
+            if me:
+                me.following_count = max(0, me.following_count - 1)
+        else:
+            followings.add(target_uid)
+            followers.add(uid)
+            followed = True
+            target.followers_count += 1
+            me = db.users.get(uid)
+            if me:
+                me.following_count += 1
+            user = db.users.get(uid)
+            db.add_notification(target_uid, NotificationType.FOLLOW, "收到新关注",
+                                f'{user.nickname if user else "有人"} 关注了你',
+                                related_id=uid, related_type="user")
+        db.user_followings[uid] = followings
+        db.user_followers[target_uid] = followers
+        return success({"isFollowed": followed, "followersCount": target.followers_count})
+
     return None
 
 
@@ -479,23 +813,26 @@ def handle_search(path, qp, uid, body=None, method="GET"):
         return None
     if path == "/api/search/video":
         kw = qp.get("keyword", [""])[0]
-        page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-        sb = qp.get("sortBy", ["relevance"])[0]
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        sb = qp.get("sortBy", ["comprehensive"])[0]
         if not kw:
-            return success({"list": [], "total": 0, "page": page, "pageSize": ps, "hasMore": False})
-        kwl = kw.lower()
-        vs = [v for v in db.videos.values() if v.status == "published" and
-              (kwl in v.title.lower() or kwl in v.description.lower())]
-        if sb == "new":
-            vs.sort(key=lambda x: x.created_at, reverse=True)
-        elif sb == "likes":
+            vs = [v for v in db.videos.values() if v.status == VideoStatus.PUBLISHED]
+        else:
+            kwl = kw.lower()
+            vs = [v for v in db.videos.values()
+                  if v.status == VideoStatus.PUBLISHED
+                  and (kwl in v.title.lower() or kwl in v.description.lower())]
+        if sb == "likes":
             vs.sort(key=lambda x: x.likes_count, reverse=True)
         elif sb == "views":
             vs.sort(key=lambda x: x.views_count, reverse=True)
+        elif sb == "new":
+            vs.sort(key=lambda x: x.created_at, reverse=True)
         else:
+            kwl = kw.lower()
             vs.sort(key=lambda x: (10 if kwl in x.title.lower() else 0) + x.views_count / 1000, reverse=True)
         s, e = (page - 1) * ps, page * ps
-        ul = db.user_likes.get(uid, set())
         items = []
         for v in vs[s:e]:
             a = db.users.get(v.user_id)
@@ -504,7 +841,8 @@ def handle_search(path, qp, uid, body=None, method="GET"):
                 "id": v.id, "title": v.title, "description": v.description,
                 "coverUrl": v.cover_url, "duration": v.duration,
                 "likesCount": v.likes_count, "commentsCount": v.comments_count,
-                "viewsCount": v.views_count, "isLiked": v.id in ul,
+                "viewsCount": v.views_count,
+                "isLiked": v.id in db.user_likes.get(uid, set()),
                 "author": author
             })
         return success({
@@ -522,22 +860,32 @@ def handle_search(path, qp, uid, body=None, method="GET"):
         us.sort(key=lambda x: x.followers_count, reverse=True)
         s, e = (page - 1) * ps, page * ps
         fs = db.user_followings.get(uid, set())
+        items = []
+        for u in us[s:e]:
+            items.append({
+                "id": u.id, "nickname": u.nickname, "username": u.username,
+                "avatar": u.avatar, "bio": u.bio,
+                "followersCount": u.followers_count, "worksCount": u.works_count,
+                "isVerified": u.is_verified, "isFollowed": u.id in fs
+            })
         return success({
-            "list": [{"id": u.id, "nickname": u.nickname, "username": u.username,
-                      "avatar": u.avatar, "bio": u.bio,
-                      "followersCount": u.followers_count, "worksCount": u.works_count,
-                      "isVerified": u.is_verified, "isFollowed": u.id in fs}
-                     for u in us[s:e]],
+            "list": items,
             "total": len(us), "page": page, "pageSize": ps, "hasMore": e < len(us)
         })
     if path == "/api/search/topic":
         kw = qp.get("keyword", [""])[0]
         page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
+        sort = qp.get("sort", ["heat"])[0]
         ts = list(db.topics.values())
         if kw:
             kwl = kw.lower()
             ts = [t for t in ts if kwl in t.name.lower() or kwl in t.description.lower()]
-        ts.sort(key=lambda x: x.views_count, reverse=True)
+        if sort == "videoCount":
+            ts.sort(key=lambda x: x.video_count, reverse=True)
+        elif sort == "views":
+            ts.sort(key=lambda x: x.views_count, reverse=True)
+        else:
+            ts.sort(key=lambda x: x.heat, reverse=True)
         s, e = (page - 1) * ps, page * ps
         return success({
             "list": [t.to_dict() for t in ts[s:e]],
@@ -558,7 +906,7 @@ def handle_search(path, qp, uid, body=None, method="GET"):
         ], "updateTime": int(time.time() * 1000)})
     if path == "/api/search/hot/videos":
         limit = int(qp.get("limit", ["20"])[0])
-        vs = sorted([v for v in db.videos.values() if v.status == "published"],
+        vs = sorted([v for v in db.videos.values() if v.status == VideoStatus.PUBLISHED],
                     key=lambda x: x.views_count, reverse=True)[:limit]
         ul = db.user_likes.get(uid, set())
         items = []
@@ -592,122 +940,223 @@ def handle_creator(path, qp, uid, body=None, method="GET"):
         u = db.users.get(uid)
         if not u:
             return error("用户不存在", 404)
-        vs = [v for v in db.videos.values() if v.user_id == uid and v.status == "published"]
+        vs = [v for v in db.videos.values() if v.user_id == uid and v.status == VideoStatus.PUBLISHED]
         tv = sum(v.views_count for v in vs)
         tl = sum(v.likes_count for v in vs)
         tc = sum(v.comments_count for v in vs)
         ts = sum(v.shares_count for v in vs)
+        tcol = sum(v.collects_count for v in vs)
         return success({
-            "summary": {"followersCount": u.followers_count, "worksCount": u.works_count,
-                        "totalViews": tv, "totalLikes": tl, "totalComments": tc, "totalShares": ts},
-            "today": {"newFans": int(u.followers_count * 0.05), "newViews": int(tv * 0.03),
-                      "newLikes": int(tl * 0.02), "newComments": int(tc * 0.04)},
-            "trend": {"fansTrend": [120, 150, 180, 200, 220, 250, 280],
-                      "viewsTrend": [5000, 6200, 7800, 8500, 9200, 10500, 12000],
-                      "likesTrend": [800, 950, 1100, 1300, 1500, 1700, 2000],
-                      "dates": ["06-01", "06-02", "06-03", "06-04", "06-05", "06-06", "06-07"]}
+            "summary": {
+                "followersCount": u.followers_count, "worksCount": u.works_count,
+                "totalViews": tv, "totalLikes": tl, "totalComments": tc,
+                "totalShares": ts, "totalCollects": tcol
+            },
+            "today": {
+                "newFans": int(u.followers_count * 0.05),
+                "newViews": int(tv * 0.03),
+                "newLikes": int(tl * 0.02),
+                "newComments": int(tc * 0.04),
+                "newCollects": int(tcol * 0.03)
+            },
+            "trend": {
+                "fansTrend": [120, 150, 180, 200, 220, 250, 280],
+                "viewsTrend": [5000, 6000, 5500, 7000, 6500, 8000, 9000],
+                "likesTrend": [200, 250, 230, 280, 300, 350, 400],
+            }
         })
+
     if path == "/api/creator/videos":
-        page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
-        st = qp.get("status", ["all"])[0]
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["10"])[0])
+        status = qp.get("status", ["all"])[0]
         vs = [v for v in db.videos.values() if v.user_id == uid]
-        if st != "all":
-            vs = [v for v in vs if v.status == st]
+        if status != "all":
+            vs = [v for v in vs if v.status == status]
         vs.sort(key=lambda x: x.created_at, reverse=True)
         s, e = (page - 1) * ps, page * ps
+        items = []
+        for v in vs[s:e]:
+            items.append({
+                **v.to_dict(),
+                "heat": int(v.views_count * 0.1 + v.likes_count * 2 + v.comments_count * 5)
+            })
         return success({
-            "list": [{"id": v.id, "title": v.title, "coverUrl": v.cover_url,
-                      "duration": v.duration, "status": v.status,
-                      "viewsCount": v.views_count, "likesCount": v.likes_count,
-                      "commentsCount": v.comments_count, "sharesCount": v.shares_count,
-                      "createdAt": v.created_at} for v in vs[s:e]],
-            "total": len(vs), "page": page, "pageSize": ps, "hasMore": e < len(vs)
+            "list": items, "total": len(vs),
+            "page": page, "pageSize": ps, "hasMore": e < len(vs)
         })
-    if path == "/api/creator/earnings":
-        e = db.earnings.get(uid)
-        if not e:
-            return error("收益数据不存在", 404)
-        return success({
-            "total": {"totalEarnings": e.total_earnings,
-                      "withdrawable": e.withdrawable, "pending": e.pending},
-            "overview": {"today": e.today_earnings,
-                         "yesterday": int(e.today_earnings * 0.85),
-                         "week": e.week_earnings, "month": e.month_earnings},
-            "trend": {"daily": [
-                {"date": "06-01", "amount": 35.5}, {"date": "06-02", "amount": 42.3},
-                {"date": "06-03", "amount": 38.7}, {"date": "06-04", "amount": 55.2},
-                {"date": "06-05", "amount": 48.9}, {"date": "06-06", "amount": 62.1},
-                {"date": "06-07", "amount": e.today_earnings}]},
-            "sources": [
-                {"name": "创作收益", "amount": int(e.month_earnings * 0.6), "percent": 60},
-                {"name": "广告分成", "amount": int(e.month_earnings * 0.25), "percent": 25},
-                {"name": "直播打赏", "amount": int(e.month_earnings * 0.1), "percent": 10},
-                {"name": "其他", "amount": int(e.month_earnings * 0.05), "percent": 5}]
-        })
-    if path == "/api/creator/fans":
-        u = db.users.get(uid)
-        if not u:
-            return error("用户不存在", 404)
-        fids = list(db.user_followers.get(uid, set()))
-        fus = [db.users[x] for x in fids if x in db.users][:10]
-        fs = db.user_followings.get(uid, set())
-        now = int(time.time() * 1000)
-        return success({
-            "total": u.followers_count, "newToday": int(u.followers_count * 0.02),
-            "trend": {"data": [100, 150, 200, 280, 350, 420, 500],
-                      "dates": ["06-01", "06-02", "06-03", "06-04", "06-05", "06-06", "06-07"]},
-            "recentFans": [{"id": fu.id, "nickname": fu.nickname, "avatar": fu.avatar,
-                            "isFollowBack": fu.id in fs,
-                            "followTime": now - 3600000 * (i + 1)}
-                           for i, fu in enumerate(fus)],
-            "analysis": {
-                "gender": {"male": 58, "female": 42},
-                "age": [{"range": "18-24", "percent": 40}, {"range": "25-30", "percent": 30},
-                        {"range": "31-40", "percent": 20}, {"range": "其他", "percent": 10}],
-                "activeTime": [
-                    {"hour": 0, "value": 20}, {"hour": 6, "value": 15},
-                    {"hour": 12, "value": 45}, {"hour": 18, "value": 70},
-                    {"hour": 21, "value": 90}, {"hour": 23, "value": 50}]}
-        })
-    m = re.match(r"^/api/creator/videos/([^/]+)/data$", path)
+
+    m = re.match(r"/api/creator/video/([\w-]+)$", path)
     if m:
-        v = db.videos.get(m.group(1))
+        vid = m.group(1)
+        v = db.videos.get(vid)
         if not v or v.user_id != uid:
             return error("视频不存在", 404)
+        stats_list = db.video_stats_daily.get(vid, [])
         return success({
-            "videoId": v.id, "title": v.title, "coverUrl": v.cover_url,
-            "views": {"total": v.views_count, "today": int(v.views_count * 0.1),
-                      "trend": {"data": [100, 250, 380, 520, 680, 850, 1000],
-                                "dates": ["06-01", "06-02", "06-03", "06-04", "06-05", "06-06", "06-07"]}},
-            "interactions": {"likes": v.likes_count, "comments": v.comments_count,
-                             "shares": v.shares_count, "collects": v.collects_count},
-            "audience": {
-                "gender": {"male": 55, "female": 45},
-                "age": [{"range": "<18", "percent": 10}, {"range": "18-24", "percent": 35},
-                        {"range": "25-30", "percent": 28}, {"range": "31-40", "percent": 18},
-                        {"range": ">40", "percent": 9}],
-                "regions": [
-                    {"name": "广东", "value": 15}, {"name": "浙江", "value": 12},
-                    {"name": "江苏", "value": 10}, {"name": "北京", "value": 9},
-                    {"name": "上海", "value": 8}, {"name": "其他", "value": 46}]},
-            "playDuration": {
-                "avgPlayDuration": int(v.duration * 0.7), "completionRate": 68.5,
-                "dropPoints": [
-                    {"time": 0, "retention": 100}, {"time": 5, "retention": 85},
-                    {"time": 10, "retention": 72}, {"time": 15, "retention": 65},
-                    {"time": 20, "retention": 58}, {"time": 25, "retention": 52},
-                    {"time": 30, "retention": 45}]}})
+            "video": v.to_dict(),
+            "stats": {
+                "views": v.views_count,
+                "likes": v.likes_count,
+                "comments": v.comments_count,
+                "collects": v.collects_count,
+                "shares": v.shares_count
+            },
+            "dailyStats": [s.to_dict() for s in stats_list[:7]],
+            "playDuration": int(v.duration * v.views_count * 0.6),
+            "completionRate": 68.5
+        })
+
+    if path == "/api/creator/earnings":
+        earning = db.earnings.get(uid)
+        if not earning:
+            return error("数据不存在", 404)
+        return success({
+            **earning.to_dict(),
+            "dailyEarnings": [
+                {"date": f"2026-06-0{i+1}", "amount": 10 + i * 3.5} for i in range(7)
+            ],
+            "monthEarnings": [
+                {"month": "2026-01", "amount": 800},
+                {"month": "2026-02", "amount": 1200},
+                {"month": "2026-03", "amount": 950},
+                {"month": "2026-04", "amount": 1500},
+                {"month": "2026-05", "amount": 1800},
+                {"month": "2026-06", "amount": 2200},
+            ]
+        })
+
+    if path == "/api/creator/fans":
+        u = db.users.get(uid)
+        return success({
+            "total": u.followers_count if u else 0,
+            "todayNew": 128,
+            "gender": {"male": 45, "female": 55},
+            "age": [
+                {"range": "18-24", "percent": 35},
+                {"range": "25-34", "percent": 40},
+                {"range": "35-44", "percent": 15},
+                {"range": "45+", "percent": 10},
+            ],
+            "region": [
+                {"name": "广东", "percent": 18},
+                {"name": "北京", "percent": 12},
+                {"name": "上海", "percent": 10},
+                {"name": "浙江", "percent": 9},
+                {"name": "江苏", "percent": 8},
+            ],
+            "activeTime": [2, 1, 0, 0, 0, 1, 3, 8, 15, 20, 18, 15,
+                           12, 10, 8, 10, 15, 25, 35, 40, 38, 30, 20, 10]
+        })
+
+    if path == "/api/creator/stats/trend":
+        period = qp.get("period", ["7d"])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
+        days = 7
+        if period == "30d":
+            days = 30
+        elif period == "custom" and start_date and end_date:
+            try:
+                t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
+                t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
+                days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+            except:
+                days = 7
+        views = []
+        likes = []
+        comments = []
+        collects = []
+        shares = []
+        new_fans = []
+        earnings = []
+        dates = []
+        now = int(time.time() * 1000)
+        for i in range(days):
+            d = now - 86400000 * (days - 1 - i)
+            date_str = time.strftime("%Y-%m-%d", time.localtime(d / 1000))
+            dates.append(date_str)
+            base = 1000 + i * 100
+            views.append(int(base * (1 + 0.2 * math.sin(i * 0.5))))
+            likes.append(int(base * 0.05 * (1 + 0.3 * math.cos(i * 0.3))))
+            comments.append(int(base * 0.01 * (1 + 0.2 * math.sin(i * 0.7))))
+            collects.append(int(base * 0.008 * (1 + 0.25 * math.cos(i * 0.4))))
+            shares.append(int(base * 0.005 * (1 + 0.15 * math.sin(i * 0.6))))
+            new_fans.append(int(50 + i * 3 + 10 * math.sin(i * 0.8)))
+            earnings.append(round(10 + i * 1.5 + 3 * math.sin(i * 0.5), 2))
+        return success({
+            "period": period, "days": days,
+            "dates": dates,
+            "views": views, "likes": likes, "comments": comments,
+            "collects": collects, "shares": shares,
+            "newFans": new_fans, "earnings": earnings,
+            "summary": {
+                "totalViews": sum(views),
+                "totalLikes": sum(likes),
+                "totalComments": sum(comments),
+                "totalCollects": sum(collects),
+                "totalShares": sum(shares),
+                "totalNewFans": sum(new_fans),
+                "totalEarnings": round(sum(earnings), 2)
+            }
+        })
+
+    m = re.match(r"/api/creator/video/([\w-]+)/stats$", path)
+    if m:
+        vid = m.group(1)
+        period = qp.get("period", ["7d"])[0]
+        v = db.videos.get(vid)
+        if not v or v.user_id != uid:
+            return error("视频不存在", 404)
+        days = 7
+        if period == "30d":
+            days = 30
+        stats_list = db.video_stats_daily.get(vid, [])
+        stats = stats_list[:days]
+        stats.reverse()
+        return success({
+            "period": period,
+            "total": {
+                "views": v.views_count,
+                "likes": v.likes_count,
+                "comments": v.comments_count,
+                "collects": v.collects_count,
+                "shares": v.shares_count
+            },
+            "daily": [s.to_dict() for s in stats],
+            "playDuration": [int(v.duration * 0.6 * s.views / 60) for s in stats],
+            "completionRate": [60 + i * 2 for i in range(len(stats))]
+        })
+
     return None
 
 
 def handle_audit(path, qp, uid, body=None, method="GET"):
     if method == "GET":
         if path == "/api/audit/report/list":
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["20"])[0])
             st = qp.get("status", ["all"])[0]
+            reason = qp.get("reason", ["all"])[0]
+            start_date = qp.get("startDate", [None])[0]
+            end_date = qp.get("endDate", [None])[0]
             rs = list(db.reports.values())
             if st != "all":
                 rs = [r for r in rs if r.status == st]
+            if reason != "all":
+                rs = [r for r in rs if r.reason == reason]
+            if start_date:
+                try:
+                    t = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                    rs = [r for r in rs if r.created_at >= t]
+                except:
+                    pass
+            if end_date:
+                try:
+                    t = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000) + 86400000
+                    rs = [r for r in rs if r.created_at < t]
+                except:
+                    pass
             rs.sort(key=lambda x: x.created_at, reverse=True)
             s, e = (page - 1) * ps, page * ps
             items = []
@@ -721,14 +1170,45 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 items.append({
                     "id": r.id, "video": video_info, "reporter": reporter_info,
                     "reason": r.reason, "description": r.description,
-                    "status": r.status, "createdAt": r.created_at
+                    "status": r.status, "createdAt": r.created_at,
+                    "handlerId": r.handler_id, "handleNote": r.handle_note,
+                    "handledAt": r.handled_at
                 })
             return success({
                 "list": items,
                 "total": len(rs), "page": page, "pageSize": ps, "hasMore": e < len(rs)
             })
+
+        m = re.match(r"/api/audit/report/([\w-]+)$", path)
+        if m:
+            rid = m.group(1)
+            r = db.reports.get(rid)
+            if not r:
+                return error("举报不存在", 404)
+            v = db.videos.get(r.video_id)
+            u = db.users.get(r.user_id)
+            video_info = v.to_dict() if v else None
+            reporter_info = {"id": u.id, "nickname": u.nickname,
+                             "avatar": u.avatar} if u else None
+            return success({
+                **r.to_dict(),
+                "video": video_info,
+                "reporter": reporter_info
+            })
+
+        if path == "/api/audit/report/reasons":
+            return success({"list": [
+                {"value": "porn", "label": "色情低俗"},
+                {"value": "violence", "label": "暴力血腥"},
+                {"value": "plagiarism", "label": "抄袭搬运"},
+                {"value": "fake", "label": "虚假信息"},
+                {"value": "illegal", "label": "违法违规"},
+                {"value": "other", "label": "其他"},
+            ]})
+
         if path == "/api/audit/notifications":
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["20"])[0])
             t = qp.get("type", ["all"])[0]
             ns = db.notifications.get(uid, [])
             if t != "all":
@@ -740,18 +1220,39 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 "total": len(ns), "unreadCount": uc,
                 "page": page, "pageSize": ps, "hasMore": e < len(ns)
             })
+
         if path == "/api/audit/notifications/unread-count":
             ns = db.notifications.get(uid, [])
-            return success({"total": sum(1 for n in ns if not n.is_read),
-                            "byType": {
-                                "like": sum(1 for n in ns if not n.is_read and n.type == "like"),
-                                "comment": sum(1 for n in ns if not n.is_read and n.type == "comment"),
-                                "follow": sum(1 for n in ns if not n.is_read and n.type == "follow"),
-                                "system": sum(1 for n in ns if not n.is_read and n.type == "system")}})
+            return success({
+                "total": sum(1 for n in ns if not n.is_read),
+                "like": sum(1 for n in ns if not n.is_read and n.type == "like"),
+                "comment": sum(1 for n in ns if not n.is_read and n.type == "comment"),
+                "follow": sum(1 for n in ns if not n.is_read and n.type == "follow"),
+                "system": sum(1 for n in ns if not n.is_read and n.type == "system"),
+                "audit": sum(1 for n in ns if not n.is_read and n.type == "audit"),
+                "report": sum(1 for n in ns if not n.is_read and n.type == "report"),
+            })
+
         if path == "/api/audit/audit/videos":
-            page, ps = int(qp.get("page", ["1"])[0]), int(qp.get("pageSize", ["20"])[0])
+            page = int(qp.get("page", ["1"])[0])
+            ps = int(qp.get("pageSize", ["20"])[0])
             st = qp.get("status", ["reviewing"])[0]
+            reason = qp.get("reason", ["all"])[0]
+            start_date = qp.get("startDate", [None])[0]
+            end_date = qp.get("endDate", [None])[0]
             vs = [v for v in db.videos.values() if v.status == st]
+            if start_date:
+                try:
+                    t = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                    vs = [v for v in vs if v.created_at >= t]
+                except:
+                    pass
+            if end_date:
+                try:
+                    t = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000) + 86400000
+                    vs = [v for v in vs if v.created_at < t]
+                except:
+                    pass
             vs.sort(key=lambda x: x.created_at)
             s, e = (page - 1) * ps, page * ps
             items = []
@@ -769,147 +1270,263 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 "list": items,
                 "total": len(vs), "page": page, "pageSize": ps, "hasMore": e < len(vs)
             })
+
     if method == "POST":
         if path == "/api/audit/report/video":
-            v = db.videos.get(body.get("videoId", ""))
+            vid = body.get("videoId", "")
+            v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
-            rid = str(uuid.uuid4())
-            r = Report(id=rid, video_id=body.get("videoId", ""), user_id=uid,
-                       reason=body.get("reason", ""), description=body.get("description", ""),
-                       status=ReportStatus.PENDING, created_at=int(time.time() * 1000))
+            reason = body.get("reason", "")
+            description = body.get("description", "")
+            if not reason:
+                return error("举报原因不能为空", 400)
+            rid = str(uuid.uuid4())[:8]
+            r = Report(
+                id=rid, video_id=vid, user_id=uid, reason=reason,
+                description=description, status=ReportStatus.PENDING,
+                created_at=int(time.time() * 1000),
+                handler_id=None, handle_note=None, handled_at=None
+            )
             db.reports[rid] = r
-            return success({"reportId": rid}, "举报已提交，我们将尽快处理")
-        m = re.match(r"^/api/audit/report/([^/]+)/process$", path)
+            db.add_notification(uid, NotificationType.REPORT, "举报提交成功",
+                                f'你举报的视频"{v.title}"已提交，我们会尽快处理',
+                                related_id=rid, related_type="report")
+            return success({"reportId": rid, "status": ReportStatus.PENDING}, "举报提交成功")
+
+        m = re.match(r"/api/audit/report/([\w-]+)/process$", path)
         if m:
-            r = db.reports.get(m.group(1))
+            rid = m.group(1)
+            r = db.reports.get(rid)
             if not r:
-                return error("举报记录不存在", 404)
-            r.status = ReportStatus.PROCESSING
-            if body.get("action") == "remove":
+                return error("举报不存在", 404)
+            action = body.get("action", "")
+            note = body.get("note", "")
+            if action not in ["resolve", "reject", "processing"]:
+                return error("无效的操作类型", 400)
+            now = int(time.time() * 1000)
+            if action == "resolve":
+                r.status = ReportStatus.RESOLVED
                 v = db.videos.get(r.video_id)
                 if v:
                     v.status = VideoStatus.REMOVED
-                    v.updated_at = int(time.time() * 1000)
-                    add_notification(v.user_id, NotificationType.SYSTEM,
-                                     f'您的视频"{v.title}"因违反平台规范已被下架', v.id)
-                r.status = ReportStatus.RESOLVED
-            elif body.get("action") == "dismiss":
-                r.status = ReportStatus.RESOLVED
-            return success({"reportId": r.id, "status": r.status}, "处理完成")
-        m = re.match(r"^/api/audit/video/([^/]+)/remove$", path)
+                    db.add_notification(v.user_id, NotificationType.AUDIT, "视频已下架",
+                                        f'你的视频"{v.title}"因违规已被下架',
+                                        related_id=v.id, related_type="video")
+            elif action == "reject":
+                r.status = ReportStatus.REJECTED
+            else:
+                r.status = ReportStatus.PROCESSING
+            r.handler_id = uid
+            r.handle_note = note
+            r.handled_at = now
+            reporter = db.users.get(r.user_id)
+            if reporter:
+                status_text = "已处理" if action == "resolve" else "已驳回" if action == "reject" else "处理中"
+                db.add_notification(r.user_id, NotificationType.REPORT, f"举报{status_text}",
+                                    f'你举报的视频处理结果：{note or status_text}',
+                                    related_id=rid, related_type="report")
+            return success({"reportId": rid, "status": r.status}, "处理成功")
+
+        m = re.match(r"/api/audit/video/([\w-]+)/remove$", path)
         if m:
-            v = db.videos.get(m.group(1))
+            vid = m.group(1)
+            v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
+            reason = body.get("reason", "违反平台规定")
             v.status = VideoStatus.REMOVED
             v.updated_at = int(time.time() * 1000)
-            add_notification(v.user_id, NotificationType.SYSTEM,
-                             f'您的视频"{v.title}"因{body.get("reason", "违反平台规范")}已被下架', v.id)
-            return success({"videoId": v.id, "status": "removed"}, "视频已下架")
-        m = re.match(r"^/api/audit/video/([^/]+)/restore$", path)
+            db.add_notification(v.user_id, NotificationType.AUDIT, "视频已下架",
+                                f'你的视频"{v.title}"已被下架，原因：{reason}',
+                                related_id=vid, related_type="video",
+                                extra={"reason": reason})
+            return success({"videoId": vid, "status": VideoStatus.REMOVED}, "视频已下架")
+
+        m = re.match(r"/api/audit/video/([\w-]+)/restore$", path)
         if m:
-            v = db.videos.get(m.group(1))
+            vid = m.group(1)
+            v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
             v.status = VideoStatus.PUBLISHED
             v.updated_at = int(time.time() * 1000)
-            add_notification(v.user_id, NotificationType.SYSTEM,
-                             f'您的视频"{v.title}"已恢复上架', v.id)
-            return success({"videoId": v.id, "status": "published"}, "视频已恢复")
-        m = re.match(r"^/api/audit/notifications/([^/]+)/read$", path)
+            db.add_notification(v.user_id, NotificationType.AUDIT, "视频已恢复",
+                                f'你的视频"{v.title}"已恢复上架',
+                                related_id=vid, related_type="video")
+            return success({"videoId": vid, "status": VideoStatus.PUBLISHED}, "视频已恢复")
+
+        m = re.match(r"/api/audit/video/([\w-]+)/approve$", path)
         if m:
-            ns = db.notifications.get(uid, [])
-            n = next((x for x in ns if x.id == m.group(1)), None)
-            if not n:
-                return error("通知不存在", 404)
-            n.is_read = True
-            return success(None, "已标记为已读")
-        if path == "/api/audit/notifications/read-all":
-            ns = db.notifications.get(uid, [])
-            for n in ns:
-                n.is_read = True
-            return success(None, "全部标记为已读")
-        m = re.match(r"^/api/audit/audit/videos/([^/]+)/approve$", path)
-        if m:
-            v = db.videos.get(m.group(1))
-            if not v or v.status != VideoStatus.REVIEWING:
-                return error("视频不存在或状态不正确", 404)
+            vid = m.group(1)
+            v = db.videos.get(vid)
+            if not v:
+                return error("视频不存在", 404)
+            if v.status != VideoStatus.REVIEWING:
+                return error("视频状态不支持此操作", 400)
             v.status = VideoStatus.PUBLISHED
             v.updated_at = int(time.time() * 1000)
-            add_notification(v.user_id, NotificationType.SYSTEM,
-                             f'您的视频"{v.title}"审核通过，已发布', v.id)
-            return success({"videoId": v.id, "status": "published"}, "审核通过")
-        m = re.match(r"^/api/audit/audit/videos/([^/]+)/reject$", path)
+            for tid in v.topics:
+                t = db.topics.get(tid)
+                if t:
+                    t.video_count += 1
+                    t.heat += 100
+            db.add_notification(v.user_id, NotificationType.AUDIT, "视频审核通过",
+                                f'你的视频"{v.title}"已通过审核',
+                                related_id=vid, related_type="video")
+            return success({"videoId": vid, "status": VideoStatus.PUBLISHED}, "审核通过")
+
+        m = re.match(r"/api/audit/video/([\w-]+)/reject$", path)
         if m:
-            v = db.videos.get(m.group(1))
-            if not v or v.status != VideoStatus.REVIEWING:
-                return error("视频不存在或状态不正确", 404)
-            v.status = VideoStatus.REMOVED
+            vid = m.group(1)
+            v = db.videos.get(vid)
+            if not v:
+                return error("视频不存在", 404)
+            reason = body.get("reason", "内容不符合规范")
+            v.status = VideoStatus.DRAFT
             v.updated_at = int(time.time() * 1000)
+            db.add_notification(v.user_id, NotificationType.AUDIT, "视频审核未通过",
+                                f'你的视频"{v.title}"未通过审核，原因：{reason}',
+                                related_id=vid, related_type="video",
+                                extra={"reason": reason})
+            return success({"videoId": vid, "status": VideoStatus.DRAFT}, "已驳回")
+
+        if path == "/api/audit/notifications/read":
+            nid = body.get("notificationId")
+            if nid:
+                ns = db.notifications.get(uid, [])
+                for n in ns:
+                    if n.id == nid:
+                        n.is_read = True
+                        break
+                return success(None, "已标记为已读")
+            else:
+                ns = db.notifications.get(uid, [])
+                for n in ns:
+                    n.is_read = True
+                return success(None, "全部已标记为已读")
+
+        if path == "/api/audit/topic/approvals":
+            page = int(body.get("page", 1))
+            ps = int(body.get("pageSize", 20))
+            st = body.get("status", "pending")
+            tas = [ta for ta in db.topic_applies.values() if ta.status == st]
+            tas.sort(key=lambda x: x.created_at, reverse=True)
+            s, e = (page - 1) * ps, page * ps
+            return success({
+                "list": [ta.to_dict() for ta in tas[s:e]],
+                "total": len(tas), "page": page, "pageSize": ps, "hasMore": e < len(tas)
+            })
+
+        m = re.match(r"/api/audit/topic/apply/([\w-]+)/approve$", path)
+        if m:
+            aid = m.group(1)
+            ta = db.topic_applies.get(aid)
+            if not ta:
+                return error("申请不存在", 404)
+            tid = str(uuid.uuid4())[:8]
+            topic = Topic(
+                id=tid, name=ta.name, description=ta.description,
+                video_count=0, views_count=0,
+                cover=f'https://picsum.photos/seed/{tid}/400/300',
+                heat=0, created_at=int(time.time() * 1000),
+                creator_id=ta.user_id, is_official=False
+            )
+            db.topics[tid] = topic
+            ta.status = "approved"
+            db.add_notification(ta.user_id, NotificationType.SYSTEM, "话题创建成功",
+                                f'你申请的话题"{ta.name}"已通过审核',
+                                related_id=tid, related_type="topic")
+            return success({"topicId": tid, "name": ta.name}, "话题已创建")
+
+        m = re.match(r"/api/audit/topic/apply/([\w-]+)/reject$", path)
+        if m:
+            aid = m.group(1)
+            ta = db.topic_applies.get(aid)
+            if not ta:
+                return error("申请不存在", 404)
             reason = body.get("reason", "不符合平台规范")
-            add_notification(v.user_id, NotificationType.SYSTEM,
-                             f'您的视频"{v.title}"审核未通过，原因：{reason}', v.id)
-            return success({"videoId": v.id, "status": "removed"}, "审核驳回")
+            ta.status = "rejected"
+            ta.reject_reason = reason
+            db.add_notification(ta.user_id, NotificationType.SYSTEM, "话题申请被驳回",
+                                f'你申请的话题"{ta.name}"未通过，原因：{reason}',
+                                related_id=aid, related_type="topic_apply")
+            return success(None, "已驳回")
+
     return None
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def _set_headers(self, code=200):
-        self.send_response(code)
+    def _send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, x-user-id")
         self.end_headers()
-
-    def _send(self, data, code=200):
-        self._set_headers(code)
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(body)
 
     def _body(self):
-        cl = int(self.headers.get("Content-Length", 0))
-        if cl == 0:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
             return {}
         try:
-            return json.loads(self.rfile.read(cl).decode("utf-8"))
+            return json.loads(self.rfile.read(length).decode("utf-8"))
         except:
             return {}
 
     def do_OPTIONS(self):
-        self._set_headers(200)
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.end_headers()
 
     def do_GET(self):
         p = urlparse(self.path)
         uid = get_user_id(self.headers)
         result = self._route(p.path, parse_qs(p.query), uid, None, "GET")
-        self._send_result(result)
+        if result is not None:
+            self._send_json(result)
+        else:
+            self._send_json(error("接口不存在", 404), 404)
 
     def do_POST(self):
         p = urlparse(self.path)
         uid = get_user_id(self.headers)
-        result = self._route(p.path, parse_qs(p.query), uid, self._body(), "POST")
-        self._send_result(result)
+        body = self._body()
+        result = self._route(p.path, parse_qs(p.query), uid, body, "POST")
+        if result is not None:
+            self._send_json(result)
+        else:
+            self._send_json(error("接口不存在", 404), 404)
 
     def do_PUT(self):
         p = urlparse(self.path)
         uid = get_user_id(self.headers)
-        result = self._route(p.path, parse_qs(p.query), uid, self._body(), "PUT")
-        self._send_result(result)
+        body = self._body()
+        result = self._route(p.path, parse_qs(p.query), uid, body, "PUT")
+        if result is not None:
+            self._send_json(result)
+        else:
+            self._send_json(error("接口不存在", 404), 404)
 
     def do_DELETE(self):
         p = urlparse(self.path)
         uid = get_user_id(self.headers)
         result = self._route(p.path, parse_qs(p.query), uid, None, "DELETE")
-        self._send_result(result)
+        if result is not None:
+            self._send_json(result)
+        else:
+            self._send_json(error("接口不存在", 404), 404)
 
     def _route(self, path, qp, uid, body, method):
-        if path == "/":
+        if path == "/" or path == "":
             return success({
-                "name": "短视频平台后端服务", "version": "1.0.0",
+                "name": "短视频平台后端服务",
+                "version": "2.0.0",
                 "description": "为多个客户端提供内容与互动能力的短视频平台后端",
                 "apis": {
                     "video": "/api/video - 视频流接口",
@@ -918,35 +1535,28 @@ class Handler(BaseHTTPRequestHandler):
                     "interaction": "/api/interaction - 互动接口",
                     "search": "/api/search - 搜索接口",
                     "creator": "/api/creator - 创作者接口",
-                    "audit": "/api/audit - 审核接口",
+                    "audit": "/api/audit - 审核接口"
                 }
             })
-
-        for handler in [handle_video, handle_publish, handle_account,
-                        handle_interaction, handle_search, handle_creator, handle_audit]:
+        handlers = [
+            handle_video, handle_publish, handle_account,
+            handle_interaction, handle_search, handle_creator, handle_audit
+        ]
+        for handler in handlers:
             r = handler(path, qp, uid, body, method)
             if r is not None:
                 return r
+        return None
 
-        return error("接口不存在", 404)
-
-    def _send_result(self, result):
-        code = result.get("code", 0)
-        status = 200
-        if code == 404:
-            status = 404
-        elif code >= 400:
-            status = code
-        elif code != 0:
-            status = 400
-        self._send(result, status)
+    def log_message(self, format, *args):
+        pass
 
 
-def run_server(port=8000):
-    server = HTTPServer(("", port), Handler)
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8000), Handler)
     print("=" * 40)
     print("  短视频平台后端服务已启动")
-    print(f"  服务地址: http://localhost:{port}")
+    print("  服务地址: http://localhost:8000")
     print("=" * 40)
     print()
     print("  API 分组：")
@@ -959,13 +1569,10 @@ def run_server(port=8000):
     print("  7. 审核接口     - /api/audit")
     print()
     print("  测试账号 (x-user-id): u1 ~ u6")
+    print("  管理员账号 (x-user-id): u_admin")
     print("=" * 40)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止")
         server.server_close()
-
-
-if __name__ == "__main__":
-    run_server()

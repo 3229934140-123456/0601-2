@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from enum import Enum
 
 
@@ -14,6 +14,7 @@ class ReportStatus(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     RESOLVED = "resolved"
+    REJECTED = "rejected"
 
 
 class NotificationType(str, Enum):
@@ -21,6 +22,17 @@ class NotificationType(str, Enum):
     COMMENT = "comment"
     FOLLOW = "follow"
     SYSTEM = "system"
+    AUDIT = "audit"
+    REPORT = "report"
+
+
+class UploadStatus(str, Enum):
+    INIT = "init"
+    UPLOADING = "uploading"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 @dataclass
@@ -102,7 +114,9 @@ class Comment:
     likes_count: int
     reply_count: int
     parent_id: Optional[str]
+    root_id: Optional[str]
     created_at: int
+    is_deleted: bool = False
 
     def to_dict(self):
         return {
@@ -113,7 +127,9 @@ class Comment:
             "likesCount": self.likes_count,
             "replyCount": self.reply_count,
             "parentId": self.parent_id,
+            "rootId": self.root_id,
             "createdAt": self.created_at,
+            "isDeleted": self.is_deleted,
         }
 
 
@@ -140,6 +156,30 @@ class Danmaku:
 
 
 @dataclass
+class DraftHistory:
+    version: int
+    title: str
+    description: str
+    cover_url: str
+    video_url: str
+    duration: int
+    topics: List[str]
+    updated_at: int
+
+    def to_dict(self):
+        return {
+            "version": self.version,
+            "title": self.title,
+            "description": self.description,
+            "coverUrl": self.cover_url,
+            "videoUrl": self.video_url,
+            "duration": self.duration,
+            "topics": self.topics,
+            "updatedAt": self.updated_at,
+        }
+
+
+@dataclass
 class Draft:
     id: str
     user_id: str
@@ -150,6 +190,7 @@ class Draft:
     duration: int
     topics: List[str]
     updated_at: int
+    history: List[DraftHistory] = field(default_factory=list)
 
     def to_dict(self):
         return {
@@ -162,6 +203,23 @@ class Draft:
             "duration": self.duration,
             "topics": self.topics,
             "updatedAt": self.updated_at,
+            "historyCount": len(self.history),
+        }
+
+
+@dataclass
+class UploadChunk:
+    chunk_index: int
+    size: int
+    uploaded: bool = False
+    failed: bool = False
+
+    def to_dict(self):
+        return {
+            "chunkIndex": self.chunk_index,
+            "size": self.size,
+            "uploaded": self.uploaded,
+            "failed": self.failed,
         }
 
 
@@ -172,20 +230,33 @@ class UploadTask:
     file_name: str
     file_size: int
     uploaded_size: int
-    status: str
+    status: UploadStatus
     video_url: Optional[str]
+    chunk_size: int
+    total_chunks: int
+    chunks: List[UploadChunk]
     created_at: int
+    updated_at: int
 
     def to_dict(self):
+        uploaded_count = sum(1 for c in self.chunks if c.uploaded)
+        progress = int(uploaded_count / self.total_chunks * 100) if self.total_chunks > 0 else 0
         return {
             "id": self.id,
+            "taskId": self.id,
             "userId": self.user_id,
             "fileName": self.file_name,
             "fileSize": self.file_size,
             "uploadedSize": self.uploaded_size,
             "status": self.status,
             "videoUrl": self.video_url,
+            "chunkSize": self.chunk_size,
+            "totalChunks": self.total_chunks,
+            "uploadedChunks": uploaded_count,
+            "progress": progress,
+            "uploadUrl": f"/api/publish/upload/{self.id}/chunk",
             "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
         }
 
 
@@ -198,6 +269,9 @@ class Report:
     description: str
     status: ReportStatus
     created_at: int
+    handler_id: Optional[str] = None
+    handle_note: Optional[str] = None
+    handled_at: Optional[int] = None
 
     def to_dict(self):
         return {
@@ -208,6 +282,9 @@ class Report:
             "description": self.description,
             "status": self.status,
             "createdAt": self.created_at,
+            "handlerId": self.handler_id,
+            "handleNote": self.handle_note,
+            "handledAt": self.handled_at,
         }
 
 
@@ -216,20 +293,26 @@ class Notification:
     id: str
     user_id: str
     type: NotificationType
+    title: str
     content: str
     related_id: Optional[str]
+    related_type: Optional[str]
     is_read: bool
     created_at: int
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self):
         return {
             "id": self.id,
             "userId": self.user_id,
             "type": self.type,
+            "title": self.title,
             "content": self.content,
             "relatedId": self.related_id,
+            "relatedType": self.related_type,
             "isRead": self.is_read,
             "createdAt": self.created_at,
+            "extra": self.extra,
         }
 
 
@@ -241,6 +324,10 @@ class Topic:
     video_count: int
     views_count: int
     cover: str
+    heat: int
+    created_at: int
+    creator_id: Optional[str] = None
+    is_official: bool = True
 
     def to_dict(self):
         return {
@@ -250,6 +337,32 @@ class Topic:
             "videoCount": self.video_count,
             "viewsCount": self.views_count,
             "cover": self.cover,
+            "heat": self.heat,
+            "createdAt": self.created_at,
+            "creatorId": self.creator_id,
+            "isOfficial": self.is_official,
+        }
+
+
+@dataclass
+class TopicApply:
+    id: str
+    user_id: str
+    name: str
+    description: str
+    status: str
+    created_at: int
+    reject_reason: Optional[str] = None
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "name": self.name,
+            "description": self.description,
+            "status": self.status,
+            "createdAt": self.created_at,
+            "rejectReason": self.reject_reason,
         }
 
 
@@ -272,4 +385,26 @@ class Earning:
             "monthEarnings": self.month_earnings,
             "withdrawable": self.withdrawable,
             "pending": self.pending,
+        }
+
+
+@dataclass
+class VideoStatsDaily:
+    video_id: str
+    date: str
+    views: int
+    likes: int
+    comments: int
+    collects: int
+    shares: int
+
+    def to_dict(self):
+        return {
+            "videoId": self.video_id,
+            "date": self.date,
+            "views": self.views,
+            "likes": self.likes,
+            "comments": self.comments,
+            "collects": self.collects,
+            "shares": self.shares,
         }

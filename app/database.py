@@ -1,9 +1,11 @@
 import uuid
 import time
+import math
 from typing import Dict, List, Set, Optional
 from .models import (
-    User, Video, Comment, Danmaku, Draft, UploadTask,
-    Report, Notification, Topic, Earning, VideoStatus, ReportStatus, NotificationType
+    User, Video, Comment, Danmaku, Draft, DraftHistory, UploadTask, UploadChunk,
+    Report, Notification, Topic, TopicApply, Earning, VideoStatsDaily,
+    VideoStatus, ReportStatus, NotificationType, UploadStatus
 )
 
 
@@ -18,7 +20,9 @@ class Database:
         self.reports: Dict[str, Report] = {}
         self.notifications: Dict[str, List[Notification]] = {}
         self.topics: Dict[str, Topic] = {}
+        self.topic_applies: Dict[str, TopicApply] = {}
         self.earnings: Dict[str, Earning] = {}
+        self.video_stats_daily: Dict[str, List[VideoStatsDaily]] = {}
 
         self.user_followings: Dict[str, Set[str]] = {}
         self.user_followers: Dict[str, Set[str]] = {}
@@ -26,8 +30,23 @@ class Database:
         self.user_collects: Dict[str, Set[str]] = {}
         self.comment_likes: Dict[str, Set[str]] = {}
         self.video_comments: Dict[str, List[str]] = {}
+        self.video_topics: Dict[str, List[str]] = {}
 
         self._init_mock_data()
+
+    def add_notification(self, user_id: str, n_type: NotificationType, title: str,
+                         content: str, related_id: Optional[str] = None,
+                         related_type: Optional[str] = None, extra: Optional[dict] = None):
+        nid = str(uuid.uuid4())[:8]
+        n = Notification(
+            id=nid, user_id=user_id, type=n_type, title=title, content=content,
+            related_id=related_id, related_type=related_type,
+            is_read=False, created_at=int(time.time() * 1000),
+            extra=extra or {}
+        )
+        if user_id not in self.notifications:
+            self.notifications[user_id] = []
+        self.notifications[user_id].insert(0, n)
 
     def _init_mock_data(self):
         now = int(time.time() * 1000)
@@ -39,17 +58,18 @@ class Database:
             User(id='u4', username='fitness_pro', nickname='健身教练小李', avatar='https://picsum.photos/seed/u4/200/200', bio='专业健身指导，帮你塑造完美身材', followers_count=89000, following_count=95, works_count=178, likes_count=670000, is_verified=False, created_at=now - 86400000 * 150),
             User(id='u5', username='cute_cat', nickname='猫咪日记', avatar='https://picsum.photos/seed/u5/200/200', bio='记录我家猫咪的日常', followers_count=15000, following_count=320, works_count=67, likes_count=98000, is_verified=False, created_at=now - 86400000 * 100),
             User(id='u6', username='music_lover', nickname='音乐分享家', avatar='https://picsum.photos/seed/u6/200/200', bio='好音乐值得被听到', followers_count=34000, following_count=210, works_count=112, likes_count=280000, is_verified=False, created_at=now - 86400000 * 180),
+            User(id='u_admin', username='admin', nickname='平台管理员', avatar='https://picsum.photos/seed/admin/200/200', bio='平台官方账号', followers_count=999999, following_count=0, works_count=0, likes_count=0, is_verified=True, created_at=now - 86400000 * 1000),
         ]
         for u in mock_users:
             self.users[u.id] = u
 
         mock_topics = [
-            Topic(id='t1', name='美食探店', description='分享各地美食探店体验', video_count=12500, views_count=8900000, cover='https://picsum.photos/seed/t1/400/300'),
-            Topic(id='t2', name='旅行vlog', description='记录旅行中的美好时光', video_count=23400, views_count=15000000, cover='https://picsum.photos/seed/t2/400/300'),
-            Topic(id='t3', name='科技数码', description='最新科技产品评测分享', video_count=8900, views_count=6700000, cover='https://picsum.photos/seed/t3/400/300'),
-            Topic(id='t4', name='健身打卡', description='一起健身，打卡每一天', video_count=18700, views_count=9800000, cover='https://picsum.photos/seed/t4/400/300'),
-            Topic(id='t5', name='萌宠日常', description='萌宠的治愈系日常', video_count=34500, views_count=23000000, cover='https://picsum.photos/seed/t5/400/300'),
-            Topic(id='t6', name='音乐分享', description='好音乐推荐与分享', video_count=15600, views_count=7800000, cover='https://picsum.photos/seed/t6/400/300'),
+            Topic(id='t1', name='美食探店', description='分享各地美食探店体验', video_count=12500, views_count=8900000, cover='https://picsum.photos/seed/t1/400/300', heat=98000, created_at=now - 86400000 * 300),
+            Topic(id='t2', name='旅行vlog', description='记录旅行中的美好时光', video_count=23400, views_count=15000000, cover='https://picsum.photos/seed/t2/400/300', heat=87000, created_at=now - 86400000 * 280),
+            Topic(id='t3', name='科技数码', description='最新科技产品评测分享', video_count=8900, views_count=6700000, cover='https://picsum.photos/seed/t3/400/300', heat=76000, created_at=now - 86400000 * 250),
+            Topic(id='t4', name='健身打卡', description='一起健身，打卡每一天', video_count=18700, views_count=9800000, cover='https://picsum.photos/seed/t4/400/300', heat=65000, created_at=now - 86400000 * 200),
+            Topic(id='t5', name='萌宠日常', description='萌宠的治愈系日常', video_count=34500, views_count=23000000, cover='https://picsum.photos/seed/t5/400/300', heat=92000, created_at=now - 86400000 * 180),
+            Topic(id='t6', name='音乐分享', description='好音乐推荐与分享', video_count=15600, views_count=7800000, cover='https://picsum.photos/seed/t6/400/300', heat=54000, created_at=now - 86400000 * 150),
         ]
         for t in mock_topics:
             self.topics[t.id] = t
@@ -104,6 +124,24 @@ class Database:
                 updated_at=now - 86400000 * i,
             )
             self.videos[video.id] = video
+            self.video_topics[video.id] = topic_ids
+
+            stats_list = []
+            for d in range(30):
+                day = now - 86400000 * d
+                date_str = time.strftime('%Y-%m-%d', time.localtime(day / 1000))
+                base_v = int(video.views_count / 30 * (1 + 0.1 * math.sin(d)))
+                base_l = int(video.likes_count / 30 * (1 + 0.15 * math.cos(d)))
+                stats = VideoStatsDaily(
+                    video_id=video.id, date=date_str,
+                    views=max(10, base_v),
+                    likes=max(5, base_l),
+                    comments=max(1, int(base_l * 0.05)),
+                    collects=max(1, int(base_l * 0.03)),
+                    shares=max(1, int(base_l * 0.02)),
+                )
+                stats_list.append(stats)
+            self.video_stats_daily[video.id] = stats_list
 
         for u in mock_users:
             self.user_followings[u.id] = set()
@@ -141,80 +179,181 @@ class Database:
                 user_id=f'u{user_idx+1}',
                 content=contents[i % 7],
                 likes_count=10 + int((i * 13) % 500),
-                reply_count=int((i * 3) % 10),
+                reply_count=0,
                 parent_id=None,
+                root_id=None,
                 created_at=now - 3600000 * i,
+                is_deleted=False,
             )
             self.comments[comment_id] = comment
             self.comment_likes[comment_id] = set()
+            if comment.video_id not in self.video_comments:
+                self.video_comments[comment.video_id] = []
+            self.video_comments[comment.video_id].append(comment_id)
 
-            vid = f'v{video_idx+1}'
-            if vid not in self.video_comments:
-                self.video_comments[vid] = []
-            self.video_comments[vid].append(comment_id)
+        for i in range(5):
+            parent_id = f'c{i*3+1}'
+            parent = self.comments.get(parent_id)
+            if parent:
+                for j in range(2):
+                    reply_id = f'cr{i}_{j}'
+                    reply = Comment(
+                        id=reply_id,
+                        video_id=parent.video_id,
+                        user_id=f'u{(j + 1) % 6 + 1}',
+                        content=f'回复{i} - {j}',
+                        likes_count=int((i + j) * 5),
+                        reply_count=0,
+                        parent_id=parent.id,
+                        root_id=parent.id,
+                        created_at=now - 3600000 * (i + j + 1),
+                        is_deleted=False,
+                    )
+                    self.comments[reply_id] = reply
+                    self.comment_likes[reply_id] = set()
+                    if parent.video_id not in self.video_comments:
+                        self.video_comments[parent.video_id] = []
+                    self.video_comments[parent.video_id].append(reply_id)
+                    parent.reply_count += 1
 
-        for i in range(30):
-            vid = f'v{i+1}'
-            if vid not in self.danmakus:
-                self.danmakus[vid] = []
-            for j in range(5):
-                contents = ['666', '前方高能', '哈哈哈哈', '打卡', '好看', '厉害']
-                colors = ['#ffffff', '#ff0000', '#00ff00', '#ffff00']
-                self.danmakus[vid].append(Danmaku(
-                    id=f'd{i*5+j+1}',
+        for vid in ['v1', 'v2', 'v3', 'v4', 'v5']:
+            self.danmakus[vid] = []
+            for i in range(10):
+                dm = Danmaku(
+                    id=f'dm_{vid}_{i}',
                     video_id=vid,
-                    user_id=f'u{j%6+1}',
-                    content=contents[j % 6],
-                    timestamp=(j + 1) * 5,
-                    color=colors[j % 4],
-                    created_at=now - 86400000 * i,
-                ))
+                    user_id=f'u{(i % 6) + 1}',
+                    content=f'弹幕{i+1} - 666',
+                    timestamp=float(i * 5 + 1),
+                    color='#ffffff',
+                    created_at=now - 3600000 * i,
+                )
+                self.danmakus[vid].append(dm)
 
-        current_user = 'u1'
-        for i in range(2, 6):
-            self.user_followings[current_user].add(f'u{i}')
-            self.user_followers[f'u{i}'].add(current_user)
+        for uid in ['u1', 'u2', 'u3']:
+            for i in range(2):
+                did = f'd{uid}_{i+1}'
+                history = []
+                for v in range(2):
+                    h = DraftHistory(
+                        version=v + 1,
+                        title=f'草稿{i+1} 第{v+1}版',
+                        description=f'草稿描述 v{v+1}',
+                        cover_url=f'https://picsum.photos/seed/draft{uid}{i}{v}/720/1280',
+                        video_url=f'https://example.com/drafts/{did}_v{v}.mp4',
+                        duration=30 + i * 10 + v * 5,
+                        topics=['t1'] if i == 0 else ['t2'],
+                        updated_at=now - 86400000 * (v + 1),
+                    )
+                    history.append(h)
+                draft = Draft(
+                    id=did,
+                    user_id=uid,
+                    title=f'我的草稿{i+1}',
+                    description='这是一个草稿的描述',
+                    cover_url=f'https://picsum.photos/seed/draft{uid}{i}/720/1280',
+                    video_url=f'https://example.com/drafts/{did}.mp4',
+                    duration=30 + i * 10,
+                    topics=['t1', 't2'] if i == 0 else ['t3'],
+                    updated_at=now - 3600000 * (i + 1),
+                    history=history,
+                )
+                self.drafts[uid].append(draft)
+
+        for i in range(3):
+            tid = f'upload_u1_{i+1}'
+            file_size = (i + 1) * 1024 * 1024 * 50
+            chunk_size = 1024 * 1024 * 5
+            total_chunks = math.ceil(file_size / chunk_size)
+            chunks = []
+            uploaded_n = int(total_chunks * (0.3 + i * 0.3))
+            for j in range(total_chunks):
+                c = UploadChunk(
+                    chunk_index=j,
+                    size=chunk_size if j < total_chunks - 1 else file_size - (total_chunks - 1) * chunk_size,
+                    uploaded=j < uploaded_n,
+                    failed=False,
+                )
+                chunks.append(c)
+            status = UploadStatus.UPLOADING if i < 2 else UploadStatus.COMPLETED
+            task = UploadTask(
+                id=tid,
+                user_id='u1',
+                file_name=f'video_{i+1}.mp4',
+                file_size=file_size,
+                uploaded_size=sum(c.size for c in chunks if c.uploaded),
+                status=status,
+                video_url=f'https://example.com/uploads/{tid}.mp4' if status == UploadStatus.COMPLETED else None,
+                chunk_size=chunk_size,
+                total_chunks=total_chunks,
+                chunks=chunks,
+                created_at=now - 86400000 * i,
+                updated_at=now - 3600000 * i,
+            )
+            self.upload_tasks[tid] = task
+
+        mock_reports = [
+            Report(id='r1', video_id='v5', user_id='u2', reason='色情低俗', description='视频内容低俗', status=ReportStatus.PENDING, created_at=now - 3600000 * 24),
+            Report(id='r2', video_id='v8', user_id='u3', reason='抄袭搬运', description='抄袭他人作品', status=ReportStatus.PROCESSING, created_at=now - 3600000 * 12, handler_id='u_admin', handle_note='正在核实', handled_at=now - 3600000 * 6),
+            Report(id='r3', video_id='v12', user_id='u1', reason='虚假信息', description='内容不实', status=ReportStatus.RESOLVED, created_at=now - 86400000 * 2, handler_id='u_admin', handle_note='已下架处理', handled_at=now - 86400000),
+        ]
+        for r in mock_reports:
+            self.reports[r.id] = r
+
+        mock_applies = [
+            TopicApply(id='ta1', user_id='u1', name='美食教程', description='分享美食制作教程', status='pending', created_at=now - 3600000 * 10),
+            TopicApply(id='ta2', user_id='u4', name='减脂餐', description='分享健康减脂餐食', status='approved', created_at=now - 86400000 * 3),
+        ]
+        for ta in mock_applies:
+            self.topic_applies[ta.id] = ta
+
+        notification_types = [
+            (NotificationType.LIKE, '收到新点赞', '有人点赞了你的视频'),
+            (NotificationType.COMMENT, '收到新评论', '有人评论了你的视频'),
+            (NotificationType.FOLLOW, '收到新关注', '有人关注了你'),
+            (NotificationType.SYSTEM, '系统通知', '你的账号已通过实名认证'),
+            (NotificationType.AUDIT, '审核通知', '你的视频已通过审核'),
+            (NotificationType.REPORT, '举报反馈', '你举报的视频已处理'),
+        ]
+        for i, (n_type, title, content) in enumerate(notification_types):
+            for j in range(2):
+                self.add_notification(
+                    'u1', n_type, title, content,
+                    related_id=f'v{i+1}', related_type='video',
+                    extra={'source': 'system'}
+                )
+
+        for i in range(1, 6):
+            target_uid = f'u{i}'
+            self.user_followings['u1'].add(target_uid)
+            self.user_followers[target_uid].add('u1')
 
         for i in range(1, 11):
-            self.user_likes[current_user].add(f'v{i}')
-        for i in range(1, 6):
-            self.user_collects[current_user].add(f'v{i}')
+            self.user_likes['u1'].add(f'v{i}')
+            self.user_collects['u1'].add(f'v{i*2}')
 
-        notifications = [
-            Notification(id='n1', user_id='u1', type=NotificationType.LIKE, content='用户旅行的意义 赞了你的视频', related_id='v1', is_read=False, created_at=now - 3600000),
-            Notification(id='n2', user_id='u1', type=NotificationType.COMMENT, content='科技极客 评论了你的视频：这个视频太精彩了！', related_id='v1', is_read=False, created_at=now - 7200000),
-            Notification(id='n3', user_id='u1', type=NotificationType.FOLLOW, content='健身教练小李 关注了你', related_id='u4', is_read=True, created_at=now - 86400000),
-            Notification(id='n4', user_id='u1', type=NotificationType.SYSTEM, content='恭喜你，你的作品获得了热门推荐', related_id='v2', is_read=True, created_at=now - 172800000),
-        ]
-        self.notifications['u1'] = notifications
-
-        draft = Draft(
-            id='d1',
-            user_id='u1',
-            title='未发布的美食探店视频',
-            description='草稿描述...',
-            cover_url='https://picsum.photos/seed/draft1/720/1280',
-            video_url='https://example.com/drafts/d1.mp4',
-            duration=45,
-            topics=['t1'],
-            updated_at=now - 3600000,
+        for uid in ['u1', 'u2', 'u3']:
+            for i in range(5):
+                self.add_notification(
+                    uid, NotificationType.LIKE, '收到新点赞',
+                    f'用户点赞了你的作品',
+                    related_id=f'v{i+1}', related_type='video'
+                )
+                self.add_notification(
+                    uid, NotificationType.COMMENT, '收到新评论',
+                    f'用户评论了你的作品',
+                    related_id=f'v{i+1}', related_type='video'
+                )
+        self.add_notification(
+            'u1', NotificationType.AUDIT, '审核结果通知',
+            '你的视频"今天去吃了这家超火的火锅店，味道绝了！"已通过审核',
+            related_id='v1', related_type='video'
         )
-        self.drafts['u1'].append(draft)
+        self.add_notification(
+            'u5', NotificationType.AUDIT, '审核结果通知',
+            '你的视频因内容违规已被下架',
+            related_id='v5', related_type='video'
+        )
 
 
 db = Database()
-
-
-def add_notification(user_id: str, type: NotificationType, content: str, related_id: Optional[str] = None):
-    notification = Notification(
-        id=str(uuid.uuid4()),
-        user_id=user_id,
-        type=type,
-        content=content,
-        related_id=related_id,
-        is_read=False,
-        created_at=int(time.time() * 1000),
-    )
-    if user_id not in db.notifications:
-        db.notifications[user_id] = []
-    db.notifications[user_id].insert(0, notification)
