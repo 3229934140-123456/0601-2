@@ -289,7 +289,7 @@ def handle_publish(path, qp, uid, body=None, method="GET"):
         user = db.users.get(uid)
         if user:
             user.works_count += 1
-        db.add_notification(uid, NotificationType.AUDIT, "视频审核中",
+        db.add_notification(uid, NotificationType.SYSTEM, "视频审核中",
                             f'你的视频"{title}"已提交审核',
                             related_id=vid, related_type="video")
         return success({"videoId": vid, "status": VideoStatus.REVIEWING}, "发布成功，正在审核中")
@@ -427,6 +427,138 @@ def handle_publish(path, qp, uid, body=None, method="GET"):
             db.drafts[uid] = []
         db.drafts[uid].append(draft)
         return success({"draftId": did, **draft.to_dict()}, "已保存为草稿")
+
+    m = re.match(r"/api/publish/drafts/from-upload/([\w-]+)$", path)
+    if m and method == "POST":
+        tid = m.group(1)
+        task = db.upload_tasks.get(tid)
+        if not task:
+            return error("上传任务不存在", 404)
+        if task.user_id != uid:
+            return error("无权限操作", 403)
+        if task.status != UploadStatus.COMPLETED:
+            return error("上传未完成，无法保存为草稿", 400)
+        did = str(uuid.uuid4())[:8]
+        now = int(time.time() * 1000)
+        title = body.get("title", task.file_name) if body else task.file_name
+        cover_url = body.get("coverUrl", "") if body else ""
+        description = body.get("description", "") if body else ""
+        topics = body.get("topics", []) if body else []
+        if not cover_url:
+            cover_url = f"https://picsum.photos/seed/{tid}/720/1280"
+        draft = Draft(
+            id=did, user_id=uid, title=title, description=description,
+            cover_url=cover_url, video_url=task.video_url or "",
+            duration=body.get("duration", 0) if body else 0,
+            topics=topics, updated_at=now, history=[]
+        )
+        if uid not in db.drafts:
+            db.drafts[uid] = []
+        db.drafts[uid].append(draft)
+        return success({"draftId": did, **draft.to_dict()}, "已保存为草稿")
+
+    if path == "/api/publish/drafts/batch-delete" and method == "POST":
+        draft_ids = body.get("draftIds", []) or []
+        user_drafts = db.drafts.get(uid, [])
+        deleted = 0
+        for did in draft_ids:
+            draft = next((d for d in user_drafts if d.id == did), None)
+            if draft:
+                user_drafts.remove(draft)
+                deleted += 1
+        return success({"deleted": deleted, "total": len(user_drafts)}, f"已删除{deleted}个草稿")
+
+    if path == "/api/publish/upload/batch-clean" and method == "POST":
+        status_filter = body.get("status", ["cancelled", "failed"]) or ["cancelled", "failed"]
+        tasks = [t for t in db.upload_tasks.values() if t.user_id == uid]
+        deleted = 0
+        for t in tasks:
+            if t.status in status_filter:
+                del db.upload_tasks[t.id]
+                deleted += 1
+        return success({"deleted": deleted}, f"已清理{deleted}个上传任务")
+
+    if path == "/api/publish/workbench" and method == "GET":
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        status = qp.get("status", ["all"])[0]
+        keyword = qp.get("keyword", [""])[0]
+        topic_id = qp.get("topicId", [""])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
+        type_filter = qp.get("type", ["video"])[0]
+
+        if type_filter == "draft":
+            items = db.drafts.get(uid, [])
+            result = []
+            for d in items:
+                if keyword and keyword not in d.title:
+                    continue
+                if topic_id and topic_id not in d.topics:
+                    continue
+                result.append(d)
+            result.sort(key=lambda x: x.updated_at, reverse=True)
+            s, e = (page - 1) * ps, page * ps
+            return success({
+                "list": [d.to_dict() for d in result[s:e]],
+                "total": len(result), "page": page, "pageSize": ps,
+                "hasMore": e < len(result)
+            })
+
+        if type_filter == "upload":
+            items = [t for t in db.upload_tasks.values() if t.user_id == uid]
+            if status != "all":
+                items = [t for t in items if t.status == status]
+            items.sort(key=lambda x: x.created_at, reverse=True)
+            s, e = (page - 1) * ps, page * ps
+            return success({
+                "list": [t.to_dict() for t in items[s:e]],
+                "total": len(items), "page": page, "pageSize": ps,
+                "hasMore": e < len(items)
+            })
+
+        vs = [v for v in db.videos.values() if v.user_id == uid]
+        if status != "all":
+            vs = [v for v in vs if v.status == status]
+        if keyword:
+            kw = keyword.lower()
+            vs = [v for v in vs if kw in v.title.lower() or kw in v.description.lower()]
+        if topic_id:
+            vs = [v for v in vs if topic_id in v.topics]
+        if start_date:
+            try:
+                t = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                vs = [v for v in vs if v.created_at >= t]
+            except:
+                pass
+        if end_date:
+            try:
+                t = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000) + 86400000
+                vs = [v for v in vs if v.created_at < t]
+            except:
+                pass
+
+        vs.sort(key=lambda x: x.created_at, reverse=True)
+        s, e = (page - 1) * ps, page * ps
+        items = []
+        for v in vs[s:e]:
+            item = enrich_video(v, uid)
+            items.append(item)
+
+        stats = {
+            "total": len([v for v in db.videos.values() if v.user_id == uid]),
+            "published": len([v for v in db.videos.values() if v.user_id == uid and v.status == VideoStatus.PUBLISHED]),
+            "reviewing": len([v for v in db.videos.values() if v.user_id == uid and v.status == VideoStatus.REVIEWING]),
+            "removed": len([v for v in db.videos.values() if v.user_id == uid and v.status == VideoStatus.REMOVED]),
+            "drafts": len(db.drafts.get(uid, [])),
+            "uploading": len([t for t in db.upload_tasks.values() if t.user_id == uid and t.status in [UploadStatus.INIT, UploadStatus.UPLOADING]]),
+        }
+
+        return success({
+            "list": items, "total": len(vs),
+            "page": page, "pageSize": ps, "hasMore": e < len(vs),
+            "stats": stats
+        })
 
     if path == "/api/publish/topics/suggest" and method == "GET":
         kw = qp.get("keyword", [""])[0]
@@ -1105,27 +1237,144 @@ def handle_creator(path, qp, uid, body=None, method="GET"):
     if m:
         vid = m.group(1)
         period = qp.get("period", ["7d"])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
         v = db.videos.get(vid)
         if not v or v.user_id != uid:
             return error("视频不存在", 404)
-        days = 7
-        if period == "30d":
-            days = 30
         stats_list = db.video_stats_daily.get(vid, [])
-        stats = stats_list[:days]
-        stats.reverse()
+        if period == "custom" and start_date and end_date:
+            filtered = []
+            for s in stats_list:
+                if start_date <= s.date <= end_date:
+                    filtered.append(s)
+            stats = list(reversed(filtered))
+        else:
+            days = 7
+            if period == "30d":
+                days = 30
+            stats = list(reversed(stats_list[:days]))
+        total_views = sum(s.views for s in stats)
+        total_likes = sum(s.likes for s in stats)
+        total_comments = sum(s.comments for s in stats)
+        total_collects = sum(s.collects for s in stats)
+        total_shares = sum(s.shares for s in stats)
+        total_new_fans = sum(s.new_fans for s in stats)
+        total_earnings = sum(s.earnings for s in stats)
         return success({
             "period": period,
+            "startDate": start_date,
+            "endDate": end_date,
             "total": {
-                "views": v.views_count,
-                "likes": v.likes_count,
-                "comments": v.comments_count,
-                "collects": v.collects_count,
-                "shares": v.shares_count
+                "views": total_views,
+                "likes": total_likes,
+                "comments": total_comments,
+                "collects": total_collects,
+                "shares": total_shares,
+                "newFans": total_new_fans,
+                "earnings": round(total_earnings, 2)
             },
             "daily": [s.to_dict() for s in stats],
             "playDuration": [int(v.duration * 0.6 * s.views / 60) for s in stats],
             "completionRate": [60 + i * 2 for i in range(len(stats))]
+        })
+
+    if path == "/api/creator/stats/videos":
+        page = int(qp.get("page", ["1"])[0])
+        ps = int(qp.get("pageSize", ["20"])[0])
+        period = qp.get("period", ["7d"])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
+        user_videos = [v for v in db.videos.values() if v.user_id == uid]
+        items = []
+        for v in user_videos:
+            stats_list = db.video_stats_daily.get(v.id, [])
+            if period == "custom" and start_date and end_date:
+                stats = [s for s in stats_list if start_date <= s.date <= end_date]
+            else:
+                days = 7 if period == "7d" else 30
+                stats = stats_list[:days]
+            item = {
+                "videoId": v.id,
+                "title": v.title,
+                "coverUrl": v.cover_url,
+                "status": v.status,
+                "views": sum(s.views for s in stats),
+                "likes": sum(s.likes for s in stats),
+                "comments": sum(s.comments for s in stats),
+                "collects": sum(s.collects for s in stats),
+                "shares": sum(s.shares for s in stats),
+                "newFans": sum(s.new_fans for s in stats),
+                "earnings": round(sum(s.earnings for s in stats), 2),
+                "publishedAt": v.created_at
+            }
+            items.append(item)
+        items.sort(key=lambda x: x["views"], reverse=True)
+        s, e = (page - 1) * ps, page * ps
+        return success({
+            "list": items[s:e],
+            "total": len(items),
+            "page": page, "pageSize": ps, "hasMore": e < len(items)
+        })
+
+    if path == "/api/creator/stats/topics":
+        period = qp.get("period", ["7d"])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
+        user_videos = [v for v in db.videos.values() if v.user_id == uid]
+        topic_stats = {}
+        for v in user_videos:
+            stats_list = db.video_stats_daily.get(v.id, [])
+            if period == "custom" and start_date and end_date:
+                stats = [s for s in stats_list if start_date <= s.date <= end_date]
+            else:
+                days = 7 if period == "7d" else 30
+                stats = stats_list[:days]
+            for tid in v.topics:
+                if tid not in topic_stats:
+                    t = db.topics.get(tid)
+                    topic_stats[tid] = {
+                        "topicId": tid,
+                        "topicName": t.name if t else tid,
+                        "videoCount": 0,
+                        "views": 0,
+                        "likes": 0,
+                        "comments": 0,
+                        "collects": 0
+                    }
+                topic_stats[tid]["videoCount"] += 1
+                topic_stats[tid]["views"] += sum(s.views for s in stats)
+                topic_stats[tid]["likes"] += sum(s.likes for s in stats)
+                topic_stats[tid]["comments"] += sum(s.comments for s in stats)
+                topic_stats[tid]["collects"] += sum(s.collects for s in stats)
+        result = sorted(topic_stats.values(), key=lambda x: x["views"], reverse=True)
+        return success({"list": result, "total": len(result)})
+
+    if path == "/api/creator/stats/time-slots":
+        period = qp.get("period", ["7d"])[0]
+        start_date = qp.get("startDate", [None])[0]
+        end_date = qp.get("endDate", [None])[0]
+        user_videos = [v for v in db.videos.values() if v.user_id == uid]
+        hourly_views = [0] * 24
+        hourly_likes = [0] * 24
+        for v in user_videos:
+            stats_list = db.video_stats_daily.get(v.id, [])
+            if period == "custom" and start_date and end_date:
+                stats = [s for s in stats_list if start_date <= s.date <= end_date]
+            else:
+                days = 7 if period == "7d" else 30
+                stats = stats_list[:days]
+            for s in stats:
+                hour_idx = hash(v.id + s.date) % 24
+                hourly_views[hour_idx] += int(s.views / 24)
+                hourly_likes[hour_idx] += int(s.likes / 24)
+        return success({
+            "period": period,
+            "startDate": start_date,
+            "endDate": end_date,
+            "hours": list(range(24)),
+            "views": hourly_views,
+            "likes": hourly_likes
         })
 
     return None
@@ -1190,10 +1439,14 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             video_info = v.to_dict() if v else None
             reporter_info = {"id": u.id, "nickname": u.nickname,
                              "avatar": u.avatar} if u else None
+            records = db.get_report_handle_records(rid)
+            records.sort(key=lambda x: x.created_at, reverse=True)
+            timeline = [rec.to_dict() for rec in records]
             return success({
                 **r.to_dict(),
                 "video": video_info,
-                "reporter": reporter_info
+                "reporter": reporter_info,
+                "timeline": timeline
             })
 
         if path == "/api/audit/report/reasons":
@@ -1227,10 +1480,15 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 "total": sum(1 for n in ns if not n.is_read),
                 "like": sum(1 for n in ns if not n.is_read and n.type == "like"),
                 "comment": sum(1 for n in ns if not n.is_read and n.type == "comment"),
+                "reply": sum(1 for n in ns if not n.is_read and n.type == "reply"),
                 "follow": sum(1 for n in ns if not n.is_read and n.type == "follow"),
                 "system": sum(1 for n in ns if not n.is_read and n.type == "system"),
-                "audit": sum(1 for n in ns if not n.is_read and n.type == "audit"),
-                "report": sum(1 for n in ns if not n.is_read and n.type == "report"),
+                "audit_pass": sum(1 for n in ns if not n.is_read and n.type == "audit_pass"),
+                "audit_reject": sum(1 for n in ns if not n.is_read and n.type == "audit_reject"),
+                "report_progress": sum(1 for n in ns if not n.is_read and n.type == "report_progress"),
+                "video_remove": sum(1 for n in ns if not n.is_read and n.type == "video_remove"),
+                "video_restore": sum(1 for n in ns if not n.is_read and n.type == "video_restore"),
+                "topic_apply": sum(1 for n in ns if not n.is_read and n.type == "topic_apply"),
             })
 
         if path == "/api/audit/audit/videos":
@@ -1240,7 +1498,11 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             reason = qp.get("reason", ["all"])[0]
             start_date = qp.get("startDate", [None])[0]
             end_date = qp.get("endDate", [None])[0]
+            author_keyword = qp.get("author", [""])[0]
             vs = [v for v in db.videos.values() if v.status == st]
+            if author_keyword:
+                ak = author_keyword.lower()
+                vs = [v for v in vs if ak in (db.users.get(v.user_id).nickname.lower() if db.users.get(v.user_id) else "")]
             if start_date:
                 try:
                     t = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
@@ -1289,7 +1551,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 handler_id=None, handle_note=None, handled_at=None
             )
             db.reports[rid] = r
-            db.add_notification(uid, NotificationType.REPORT, "举报提交成功",
+            db.add_notification(uid, NotificationType.REPORT_PROGRESS, "举报提交成功",
                                 f'你举报的视频"{v.title}"已提交，我们会尽快处理',
                                 related_id=rid, related_type="report")
             return success({"reportId": rid, "status": ReportStatus.PENDING}, "举报提交成功")
@@ -1308,9 +1570,11 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             if action == "resolve":
                 r.status = ReportStatus.RESOLVED
                 v = db.videos.get(r.video_id)
-                if v:
+                if v and v.status == VideoStatus.PUBLISHED:
                     v.status = VideoStatus.REMOVED
-                    db.add_notification(v.user_id, NotificationType.AUDIT, "视频已下架",
+                    v.updated_at = now
+                    db.add_topic_video_count(v.topics, -1)
+                    db.add_notification(v.user_id, NotificationType.VIDEO_REMOVE, "视频已下架",
                                         f'你的视频"{v.title}"因违规已被下架',
                                         related_id=v.id, related_type="video")
             elif action == "reject":
@@ -1320,10 +1584,11 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             r.handler_id = uid
             r.handle_note = note
             r.handled_at = now
+            db.add_report_handle_record(rid, uid, action, note)
             reporter = db.users.get(r.user_id)
             if reporter:
                 status_text = "已处理" if action == "resolve" else "已驳回" if action == "reject" else "处理中"
-                db.add_notification(r.user_id, NotificationType.REPORT, f"举报{status_text}",
+                db.add_notification(r.user_id, NotificationType.REPORT_PROGRESS, f"举报{status_text}",
                                     f'你举报的视频处理结果：{note or status_text}',
                                     related_id=rid, related_type="report")
             return success({"reportId": rid, "status": r.status}, "处理成功")
@@ -1334,10 +1599,13 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
+            if v.status != VideoStatus.PUBLISHED:
+                return error("只有已发布的视频才能下架", 400)
             reason = body.get("reason", "违反平台规定")
             v.status = VideoStatus.REMOVED
             v.updated_at = int(time.time() * 1000)
-            db.add_notification(v.user_id, NotificationType.AUDIT, "视频已下架",
+            db.add_topic_video_count(v.topics, -1)
+            db.add_notification(v.user_id, NotificationType.VIDEO_REMOVE, "视频已下架",
                                 f'你的视频"{v.title}"已被下架，原因：{reason}',
                                 related_id=vid, related_type="video",
                                 extra={"reason": reason})
@@ -1349,9 +1617,12 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
+            if v.status != VideoStatus.REMOVED:
+                return error("只有已下架的视频才能恢复", 400)
             v.status = VideoStatus.PUBLISHED
             v.updated_at = int(time.time() * 1000)
-            db.add_notification(v.user_id, NotificationType.AUDIT, "视频已恢复",
+            db.add_topic_video_count(v.topics, 1)
+            db.add_notification(v.user_id, NotificationType.VIDEO_RESTORE, "视频已恢复",
                                 f'你的视频"{v.title}"已恢复上架',
                                 related_id=vid, related_type="video")
             return success({"videoId": vid, "status": VideoStatus.PUBLISHED}, "视频已恢复")
@@ -1366,12 +1637,8 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 return error("视频状态不支持此操作", 400)
             v.status = VideoStatus.PUBLISHED
             v.updated_at = int(time.time() * 1000)
-            for tid in v.topics:
-                t = db.topics.get(tid)
-                if t:
-                    t.video_count += 1
-                    t.heat += 100
-            db.add_notification(v.user_id, NotificationType.AUDIT, "视频审核通过",
+            db.add_topic_video_count(v.topics, 1)
+            db.add_notification(v.user_id, NotificationType.AUDIT_PASS, "视频审核通过",
                                 f'你的视频"{v.title}"已通过审核',
                                 related_id=vid, related_type="video")
             return success({"videoId": vid, "status": VideoStatus.PUBLISHED}, "审核通过")
@@ -1382,14 +1649,64 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             v = db.videos.get(vid)
             if not v:
                 return error("视频不存在", 404)
+            if v.status != VideoStatus.REVIEWING:
+                return error("视频状态不支持此操作", 400)
             reason = body.get("reason", "内容不符合规范")
             v.status = VideoStatus.DRAFT
             v.updated_at = int(time.time() * 1000)
-            db.add_notification(v.user_id, NotificationType.AUDIT, "视频审核未通过",
+            db.add_notification(v.user_id, NotificationType.AUDIT_REJECT, "视频审核未通过",
                                 f'你的视频"{v.title}"未通过审核，原因：{reason}',
                                 related_id=vid, related_type="video",
                                 extra={"reason": reason})
             return success({"videoId": vid, "status": VideoStatus.DRAFT}, "已驳回")
+
+        if path == "/api/audit/video/batch-approve" and method == "POST":
+            video_ids = body.get("videoIds", []) or []
+            success_count = 0
+            for vid in video_ids:
+                v = db.videos.get(vid)
+                if v and v.status == VideoStatus.REVIEWING:
+                    v.status = VideoStatus.PUBLISHED
+                    v.updated_at = int(time.time() * 1000)
+                    db.add_topic_video_count(v.topics, 1)
+                    db.add_notification(v.user_id, NotificationType.AUDIT_PASS, "视频审核通过",
+                                        f'你的视频"{v.title}"已通过审核',
+                                        related_id=vid, related_type="video")
+                    success_count += 1
+            return success({"success": success_count, "total": len(video_ids)}, f"已批量通过{success_count}个视频")
+
+        if path == "/api/audit/video/batch-remove" and method == "POST":
+            video_ids = body.get("videoIds", []) or []
+            reason = body.get("reason", "批量下架")
+            success_count = 0
+            for vid in video_ids:
+                v = db.videos.get(vid)
+                if v and v.status == VideoStatus.PUBLISHED:
+                    v.status = VideoStatus.REMOVED
+                    v.updated_at = int(time.time() * 1000)
+                    db.add_topic_video_count(v.topics, -1)
+                    db.add_notification(v.user_id, NotificationType.VIDEO_REMOVE, "视频已下架",
+                                        f'你的视频"{v.title}"已被下架，原因：{reason}',
+                                        related_id=vid, related_type="video",
+                                        extra={"reason": reason})
+                    success_count += 1
+            return success({"success": success_count, "total": len(video_ids)}, f"已批量下架{success_count}个视频")
+
+        if path == "/api/audit/video/batch-reject" and method == "POST":
+            video_ids = body.get("videoIds", []) or []
+            reason = body.get("reason", "内容不符合规范")
+            success_count = 0
+            for vid in video_ids:
+                v = db.videos.get(vid)
+                if v and v.status == VideoStatus.REVIEWING:
+                    v.status = VideoStatus.DRAFT
+                    v.updated_at = int(time.time() * 1000)
+                    db.add_notification(v.user_id, NotificationType.AUDIT_REJECT, "视频审核未通过",
+                                        f'你的视频"{v.title}"未通过审核，原因：{reason}',
+                                        related_id=vid, related_type="video",
+                                        extra={"reason": reason})
+                    success_count += 1
+            return success({"success": success_count, "total": len(video_ids)}, f"已批量驳回{success_count}个视频")
 
         if path == "/api/audit/notifications/read":
             nid = body.get("notificationId")
@@ -1434,7 +1751,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             )
             db.topics[tid] = topic
             ta.status = "approved"
-            db.add_notification(ta.user_id, NotificationType.SYSTEM, "话题创建成功",
+            db.add_notification(ta.user_id, NotificationType.TOPIC_APPLY, "话题创建成功",
                                 f'你申请的话题"{ta.name}"已通过审核',
                                 related_id=tid, related_type="topic")
             return success({"topicId": tid, "name": ta.name}, "话题已创建")
@@ -1448,10 +1765,80 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             reason = body.get("reason", "不符合平台规范")
             ta.status = "rejected"
             ta.reject_reason = reason
-            db.add_notification(ta.user_id, NotificationType.SYSTEM, "话题申请被驳回",
+            db.add_notification(ta.user_id, NotificationType.TOPIC_APPLY, "话题申请被驳回",
                                 f'你申请的话题"{ta.name}"未通过，原因：{reason}',
                                 related_id=aid, related_type="topic_apply")
             return success(None, "已驳回")
+
+        if path == "/api/audit/operation/trend":
+            period = body.get("period", "7d") if body else "7d"
+            start_date = body.get("startDate") if body else None
+            end_date = body.get("endDate") if body else None
+            days = 7
+            if period == "30d":
+                days = 30
+            elif period == "custom" and start_date and end_date:
+                try:
+                    t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
+                    t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
+                    days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+                except:
+                    days = 7
+            stats = db.platform_stats_daily[:days]
+            stats.reverse()
+            dates = [s.date for s in stats]
+            return success({
+                "period": period, "days": days,
+                "startDate": start_date, "endDate": end_date,
+                "dates": dates,
+                "videoPublishCount": [s.video_publish_count for s in stats],
+                "videoAuditPassCount": [s.video_audit_pass_count for s in stats],
+                "videoAuditRejectCount": [s.video_audit_reject_count for s in stats],
+                "reportCount": [s.report_count for s in stats],
+                "videoRemoveCount": [s.video_remove_count for s in stats],
+                "activeCreators": [s.active_creators for s in stats],
+                "interactionsCount": [s.interactions_count for s in stats],
+                "newUsers": [s.new_users for s in stats],
+                "summary": {
+                    "totalVideoPublish": sum(s.video_publish_count for s in stats),
+                    "totalAuditPass": sum(s.video_audit_pass_count for s in stats),
+                    "totalAuditReject": sum(s.video_audit_reject_count for s in stats),
+                    "auditPassRate": round(sum(s.video_audit_pass_count for s in stats) / max(1, sum(s.video_publish_count for s in stats)) * 100, 2),
+                    "totalReport": sum(s.report_count for s in stats),
+                    "totalRemove": sum(s.video_remove_count for s in stats),
+                    "totalInteractions": sum(s.interactions_count for s in stats),
+                    "totalNewUsers": sum(s.new_users for s in stats),
+                }
+            })
+
+        if path == "/api/audit/operation/top-topics":
+            period = body.get("period", "7d") if body else "7d"
+            limit = int((body.get("limit", 10) if body else 10))
+            topics = list(db.topics.values())
+            topics.sort(key=lambda x: x.heat, reverse=True)
+            result = []
+            for t in topics[:limit]:
+                result.append({
+                    "id": t.id,
+                    "name": t.name,
+                    "cover": t.cover,
+                    "videoCount": t.video_count,
+                    "viewsCount": t.views_count,
+                    "heat": t.heat,
+                    "isOfficial": t.is_official
+                })
+            return success({"list": result, "total": len(result)})
+
+        if path == "/api/audit/operation/top-report-reasons":
+            period = body.get("period", "7d") if body else "7d"
+            reason_count = {}
+            for r in db.reports.values():
+                reason = r.reason
+                reason_count[reason] = reason_count.get(reason, 0) + 1
+            result = sorted([
+                {"reason": k, "count": v} for k, v in reason_count.items()
+            ], key=lambda x: x["count"], reverse=True)
+            return success({"list": result, "total": len(result)})
 
     return None
 

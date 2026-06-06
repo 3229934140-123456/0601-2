@@ -20,10 +20,15 @@ class ReportStatus(str, Enum):
 class NotificationType(str, Enum):
     LIKE = "like"
     COMMENT = "comment"
+    REPLY = "reply"
     FOLLOW = "follow"
     SYSTEM = "system"
-    AUDIT = "audit"
-    REPORT = "report"
+    AUDIT_PASS = "audit_pass"
+    AUDIT_REJECT = "audit_reject"
+    REPORT_PROGRESS = "report_progress"
+    VIDEO_REMOVE = "video_remove"
+    VIDEO_RESTORE = "video_restore"
+    TOPIC_APPLY = "topic_apply"
 
 
 class UploadStatus(str, Enum):
@@ -397,6 +402,8 @@ class VideoStatsDaily:
     comments: int
     collects: int
     shares: int
+    new_fans: int = 0
+    earnings: float = 0.0
 
     def to_dict(self):
         return {
@@ -407,4 +414,54 @@ class VideoStatsDaily:
             "comments": self.comments,
             "collects": self.collects,
             "shares": self.shares,
+            "newFans": self.new_fans,
+            "earnings": self.earnings,
+        }
+
+
+@dataclass
+class ReportHandleRecord:
+    id: str
+    report_id: str
+    handler_id: str
+    handler_name: str
+    action: str
+    note: str
+    created_at: int
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "reportId": self.report_id,
+            "handlerId": self.handler_id,
+            "handlerName": self.handler_name,
+            "action": self.action,
+            "note": self.note,
+            "createdAt": self.created_at,
+        }
+
+
+@dataclass
+class PlatformStatsDaily:
+    date: str
+    video_publish_count: int
+    video_audit_pass_count: int
+    video_audit_reject_count: int
+    report_count: int
+    video_remove_count: int
+    active_creators: int
+    interactions_count: int
+    new_users: int
+
+    def to_dict(self):
+        return {
+            "date": self.date,
+            "videoPublishCount": self.video_publish_count,
+            "videoAuditPassCount": self.video_audit_pass_count,
+            "videoAuditRejectCount": self.video_audit_reject_count,
+            "reportCount": self.report_count,
+            "videoRemoveCount": self.video_remove_count,
+            "activeCreators": self.active_creators,
+            "interactionsCount": self.interactions_count,
+            "newUsers": self.new_users,
         }

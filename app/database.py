@@ -5,6 +5,7 @@ from typing import Dict, List, Set, Optional
 from .models import (
     User, Video, Comment, Danmaku, Draft, DraftHistory, UploadTask, UploadChunk,
     Report, Notification, Topic, TopicApply, Earning, VideoStatsDaily,
+    ReportHandleRecord, PlatformStatsDaily,
     VideoStatus, ReportStatus, NotificationType, UploadStatus
 )
 
@@ -23,6 +24,8 @@ class Database:
         self.topic_applies: Dict[str, TopicApply] = {}
         self.earnings: Dict[str, Earning] = {}
         self.video_stats_daily: Dict[str, List[VideoStatsDaily]] = {}
+        self.report_handle_records: Dict[str, List[ReportHandleRecord]] = {}
+        self.platform_stats_daily: List[PlatformStatsDaily] = []
 
         self.user_followings: Dict[str, Set[str]] = {}
         self.user_followers: Dict[str, Set[str]] = {}
@@ -47,6 +50,36 @@ class Database:
         if user_id not in self.notifications:
             self.notifications[user_id] = []
         self.notifications[user_id].insert(0, n)
+
+    def add_topic_video_count(self, topic_ids: List[str], delta: int = 1):
+        for tid in topic_ids:
+            t = self.topics.get(tid)
+            if t:
+                t.video_count = max(0, t.video_count + delta)
+                t.heat = max(0, t.heat + delta * 100)
+
+    def add_topic_views(self, topic_id: str, views: int):
+        t = self.topics.get(topic_id)
+        if t:
+            t.views_count += views
+
+    def add_report_handle_record(self, report_id: str, handler_id: str,
+                                  action: str, note: str):
+        handler = self.users.get(handler_id)
+        handler_name = handler.nickname if handler else "系统"
+        rid = str(uuid.uuid4())[:8]
+        record = ReportHandleRecord(
+            id=rid, report_id=report_id, handler_id=handler_id,
+            handler_name=handler_name, action=action, note=note,
+            created_at=int(time.time() * 1000)
+        )
+        if report_id not in self.report_handle_records:
+            self.report_handle_records[report_id] = []
+        self.report_handle_records[report_id].append(record)
+        return record
+
+    def get_report_handle_records(self, report_id: str) -> List[ReportHandleRecord]:
+        return self.report_handle_records.get(report_id, [])
 
     def _init_mock_data(self):
         now = int(time.time() * 1000)
@@ -312,8 +345,8 @@ class Database:
             (NotificationType.COMMENT, '收到新评论', '有人评论了你的视频'),
             (NotificationType.FOLLOW, '收到新关注', '有人关注了你'),
             (NotificationType.SYSTEM, '系统通知', '你的账号已通过实名认证'),
-            (NotificationType.AUDIT, '审核通知', '你的视频已通过审核'),
-            (NotificationType.REPORT, '举报反馈', '你举报的视频已处理'),
+            (NotificationType.AUDIT_PASS, '审核通知', '你的视频已通过审核'),
+            (NotificationType.REPORT_PROGRESS, '举报反馈', '你举报的视频已处理'),
         ]
         for i, (n_type, title, content) in enumerate(notification_types):
             for j in range(2):
@@ -345,15 +378,87 @@ class Database:
                     related_id=f'v{i+1}', related_type='video'
                 )
         self.add_notification(
-            'u1', NotificationType.AUDIT, '审核结果通知',
+            'u1', NotificationType.AUDIT_PASS, '审核结果通知',
             '你的视频"今天去吃了这家超火的火锅店，味道绝了！"已通过审核',
             related_id='v1', related_type='video'
         )
         self.add_notification(
-            'u5', NotificationType.AUDIT, '审核结果通知',
+            'u5', NotificationType.VIDEO_REMOVE, '审核结果通知',
             '你的视频因内容违规已被下架',
             related_id='v5', related_type='video'
         )
+
+        for i in range(5):
+            vid = f'v_review_{i+1}'
+            video = Video(
+                id=vid, user_id=f'u{(i % 6) + 1}',
+                title=f'待审核视频{i+1}',
+                description='等待审核的视频',
+                cover_url=f'https://picsum.photos/seed/{vid}/720/1280',
+                video_url=f'https://example.com/videos/{vid}.mp4',
+                duration=30 + i * 10,
+                likes_count=0, comments_count=0, shares_count=0,
+                views_count=0, collects_count=0,
+                topics=[f't{(i % 6) + 1}'],
+                status=VideoStatus.REVIEWING,
+                created_at=now - 3600000 * i,
+                updated_at=now - 3600000 * i,
+            )
+            self.videos[vid] = video
+            self.video_topics[vid] = [f't{(i % 6) + 1}']
+
+        for i in range(3):
+            vid = f'v_removed_{i+1}'
+            video = Video(
+                id=vid, user_id=f'u{(i % 6) + 1}',
+                title=f'已下架视频{i+1}',
+                description='违规已下架的视频',
+                cover_url=f'https://picsum.photos/seed/{vid}/720/1280',
+                video_url=f'https://example.com/videos/{vid}.mp4',
+                duration=30 + i * 10,
+                likes_count=100 + i * 50, comments_count=10 + i * 5,
+                shares_count=5 + i * 2, views_count=1000 + i * 500,
+                collects_count=20 + i * 10,
+                topics=[f't{(i % 6) + 1}'],
+                status=VideoStatus.REMOVED,
+                created_at=now - 86400000 * (i + 5),
+                updated_at=now - 86400000 * (i + 2),
+            )
+            self.videos[vid] = video
+            self.video_topics[vid] = [f't{(i % 6) + 1}']
+
+        self.add_report_handle_record('r2', 'u_admin', 'processing', '正在核实举报内容')
+        self.add_report_handle_record('r2', 'u_admin', 'processing', '已联系创作者核实')
+        self.add_report_handle_record('r3', 'u_admin', 'resolve', '确认违规，已下架视频')
+
+        for d in range(30):
+            day = now - 86400000 * d
+            date_str = time.strftime('%Y-%m-%d', time.localtime(day / 1000))
+            stats = PlatformStatsDaily(
+                date=date_str,
+                video_publish_count=50 + int(20 * math.sin(d * 0.3)),
+                video_audit_pass_count=45 + int(15 * math.sin(d * 0.3)),
+                video_audit_reject_count=5 + int(3 * math.sin(d * 0.5)),
+                report_count=20 + int(10 * math.sin(d * 0.4)),
+                video_remove_count=3 + int(2 * math.sin(d * 0.6)),
+                active_creators=1000 + int(200 * math.sin(d * 0.2)),
+                interactions_count=50000 + int(10000 * math.sin(d * 0.25)),
+                new_users=100 + int(50 * math.sin(d * 0.35)),
+            )
+            self.platform_stats_daily.append(stats)
+
+        more_notifications = [
+            (NotificationType.REPLY, '收到新回复', '有人回复了你的评论'),
+            (NotificationType.AUDIT_PASS, '审核通过', '你的视频已通过审核'),
+            (NotificationType.AUDIT_REJECT, '审核未通过', '你的视频未通过审核'),
+            (NotificationType.REPORT_PROGRESS, '举报进度', '你举报的视频有新的处理进展'),
+            (NotificationType.VIDEO_REMOVE, '视频下架通知', '你的视频因违规已被下架'),
+            (NotificationType.VIDEO_RESTORE, '视频恢复通知', '你的视频已恢复上架'),
+            (NotificationType.TOPIC_APPLY, '话题申请结果', '你申请的话题有审核结果'),
+        ]
+        for i, (n_type, title, content) in enumerate(more_notifications):
+            self.add_notification('u1', n_type, title, content,
+                                  related_id=f'v{i+10}', related_type='video')
 
 
 db = Database()
