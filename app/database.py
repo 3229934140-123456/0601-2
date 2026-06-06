@@ -63,13 +63,30 @@ class Database:
         for tid in topic_ids:
             t = self.topics.get(tid)
             if t:
-                t.views_count += views
-                t.likes_count += likes
-                t.comments_count += comments
-                t.collects_count += collects
-                t.shares_count += shares
+                t.views_count = max(0, t.views_count + views)
+                t.likes_count = max(0, t.likes_count + likes)
+                t.comments_count = max(0, t.comments_count + comments)
+                t.collects_count = max(0, t.collects_count + collects)
+                t.shares_count = max(0, t.shares_count + shares)
                 heat_delta = views + likes * 2 + comments * 3 + collects * 2 + shares * 5
-                t.heat += heat_delta
+                t.heat = max(0, t.heat + heat_delta)
+
+    def add_topic_interaction_by_video(self, video, multiplier: int = 1):
+        views = video.views_count * multiplier
+        likes = video.likes_count * multiplier
+        comments = video.comments_count * multiplier
+        collects = video.collects_count * multiplier
+        shares = video.shares_count * multiplier
+        for tid in video.topics:
+            t = self.topics.get(tid)
+            if t:
+                t.views_count = max(0, t.views_count + views)
+                t.likes_count = max(0, t.likes_count + likes)
+                t.comments_count = max(0, t.comments_count + comments)
+                t.collects_count = max(0, t.collects_count + collects)
+                t.shares_count = max(0, t.shares_count + shares)
+                heat_delta = views + likes * 2 + comments * 3 + collects * 2 + shares * 5
+                t.heat = max(0, t.heat + heat_delta)
 
     def add_topic_views(self, topic_id: str, views: int):
         t = self.topics.get(topic_id)
@@ -478,6 +495,7 @@ class Database:
                 active_creators=1000 + int(200 * math.sin(d * 0.2)),
                 interactions_count=50000 + int(10000 * math.sin(d * 0.25)),
                 new_users=100 + int(50 * math.sin(d * 0.35)),
+                earnings=round(5000 + 2000 * math.sin(d * 0.3) + 500 * math.cos(d * 0.2), 2),
             )
             self.platform_stats_daily.append(stats)
 

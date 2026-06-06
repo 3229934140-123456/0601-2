@@ -348,6 +348,8 @@ def handle_publish(path, qp, uid, body=None, method="GET"):
             draft.video_url = video_url
             draft.duration = duration
             draft.topics = topics
+            if duration > 0:
+                draft.duration_unknown = False
             draft.updated_at = now
             return success({"draftId": draft.id, **draft.to_dict()}, "草稿保存成功")
         else:
@@ -355,7 +357,8 @@ def handle_publish(path, qp, uid, body=None, method="GET"):
             draft = Draft(
                 id=did, user_id=uid, title=title, description=description,
                 cover_url=cover_url, video_url=video_url, duration=duration,
-                topics=topics, updated_at=now, history=[]
+                topics=topics, updated_at=now, history=[],
+                duration_unknown=duration == 0
             )
             if uid not in db.drafts:
                 db.drafts[uid] = []
@@ -1280,15 +1283,27 @@ def handle_creator(path, qp, uid, body=None, method="GET"):
         start_date = qp.get("startDate", [None])[0]
         end_date = qp.get("endDate", [None])[0]
         days = 7
+        start_ts = 0
+        end_ts = 0
         if period == "30d":
             days = 30
+            end_ts = int(time.time() * 1000)
+            start_ts = end_ts - 86400000 * (days - 1)
         elif period == "custom" and start_date and end_date:
             try:
-                t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
-                t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
-                days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+                t1 = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                t2 = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000)
+                days = max(1, min(90, int((t2 - t1) / 86400000) + 1))
+                start_ts = t1
+                end_ts = t2
             except:
                 days = 7
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
+        else:
+            days = 7
+            end_ts = int(time.time() * 1000)
+            start_ts = end_ts - 86400000 * (days - 1)
         views = []
         likes = []
         comments = []
@@ -1297,21 +1312,25 @@ def handle_creator(path, qp, uid, body=None, method="GET"):
         new_fans = []
         earnings = []
         dates = []
-        now = int(time.time() * 1000)
         for i in range(days):
-            d = now - 86400000 * (days - 1 - i)
+            d = start_ts + 86400000 * i
             date_str = time.strftime("%Y-%m-%d", time.localtime(d / 1000))
             dates.append(date_str)
             base = 1000 + i * 100
-            views.append(int(base * (1 + 0.2 * math.sin(i * 0.5))))
-            likes.append(int(base * 0.05 * (1 + 0.3 * math.cos(i * 0.3))))
-            comments.append(int(base * 0.01 * (1 + 0.2 * math.sin(i * 0.7))))
-            collects.append(int(base * 0.008 * (1 + 0.25 * math.cos(i * 0.4))))
-            shares.append(int(base * 0.005 * (1 + 0.15 * math.sin(i * 0.6))))
-            new_fans.append(int(50 + i * 3 + 10 * math.sin(i * 0.8)))
-            earnings.append(round(10 + i * 1.5 + 3 * math.sin(i * 0.5), 2))
+            seed = hash(date_str) % 1000
+            views.append(int(base * (1 + 0.2 * math.sin(seed * 0.01))))
+            likes.append(int(base * 0.05 * (1 + 0.3 * math.cos(seed * 0.02))))
+            comments.append(int(base * 0.01 * (1 + 0.2 * math.sin(seed * 0.03))))
+            collects.append(int(base * 0.008 * (1 + 0.25 * math.cos(seed * 0.04))))
+            shares.append(int(base * 0.005 * (1 + 0.15 * math.sin(seed * 0.05))))
+            new_fans.append(int(50 + i * 3 + 10 * math.sin(seed * 0.06)))
+            earnings.append(round(10 + i * 1.5 + 3 * math.sin(seed * 0.07), 2))
+        actual_start = dates[0] if dates else start_date
+        actual_end = dates[-1] if dates else end_date
         return success({
             "period": period, "days": days,
+            "startDate": actual_start,
+            "endDate": actual_end,
             "dates": dates,
             "views": views, "likes": likes, "comments": comments,
             "collects": collects, "shares": shares,
@@ -1624,7 +1643,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             reporter_info = {"id": u.id, "nickname": u.nickname,
                              "avatar": u.avatar} if u else None
             records = db.get_report_handle_records(rid)
-            records.sort(key=lambda x: x.created_at, reverse=True)
+            records.sort(key=lambda x: x.created_at)
             timeline = [rec.to_dict() for rec in records]
             return success({
                 **r.to_dict(),
@@ -1711,6 +1730,12 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             end_date = qp.get("endDate", [None])[0]
             author_keyword = qp.get("author", [""])[0]
             vs = [v for v in db.videos.values() if v.status == st]
+            if reason != "all":
+                reported_video_ids = set()
+                for r in db.reports.values():
+                    if r.reason == reason:
+                        reported_video_ids.add(r.video_id)
+                vs = [v for v in vs if v.id in reported_video_ids]
             if author_keyword:
                 ak = author_keyword.lower()
                 vs = [v for v in vs if ak in (db.users.get(v.user_id).nickname.lower() if db.users.get(v.user_id) else "")]
@@ -1881,6 +1906,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             v.status = VideoStatus.REMOVED
             v.updated_at = int(time.time() * 1000)
             db.add_topic_video_count(v.topics, -1)
+            db.add_topic_interaction_by_video(v, -1)
             db.add_notification(v.user_id, NotificationType.VIDEO_REMOVE, "视频已下架",
                                 f'你的视频"{v.title}"已被下架，原因：{reason}',
                                 related_id=vid, related_type="video",
@@ -1898,6 +1924,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             v.status = VideoStatus.PUBLISHED
             v.updated_at = int(time.time() * 1000)
             db.add_topic_video_count(v.topics, 1)
+            db.add_topic_interaction_by_video(v, 1)
             db.add_notification(v.user_id, NotificationType.VIDEO_RESTORE, "视频已恢复",
                                 f'你的视频"{v.title}"已恢复上架',
                                 related_id=vid, related_type="video")
@@ -2074,21 +2101,56 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             start_date = body.get("startDate") if body else None
             end_date = body.get("endDate") if body else None
             days = 7
+            start_ts = 0
+            end_ts = 0
             if period == "30d":
                 days = 30
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
             elif period == "custom" and start_date and end_date:
                 try:
-                    t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
-                    t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
-                    days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+                    t1 = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                    t2 = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000)
+                    days = max(1, min(90, int((t2 - t1) / 86400000) + 1))
+                    start_ts = t1
+                    end_ts = t2
                 except:
                     days = 7
-            stats = db.platform_stats_daily[:days]
-            stats.reverse()
-            dates = [s.date for s in stats]
+                    end_ts = int(time.time() * 1000)
+                    start_ts = end_ts - 86400000 * (days - 1)
+            else:
+                days = 7
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
+            all_stats = db.platform_stats_daily
+            stats_by_date = {s.date: s for s in all_stats}
+            stats = []
+            dates = []
+            for i in range(days):
+                d_ts = start_ts + 86400000 * i
+                date_str = time.strftime("%Y-%m-%d", time.localtime(d_ts / 1000))
+                dates.append(date_str)
+                if date_str in stats_by_date:
+                    stats.append(stats_by_date[date_str])
+                else:
+                    seed = hash(date_str) % 1000
+                    stats.append(PlatformStatsDaily(
+                        date=date_str,
+                        video_publish_count=50 + int(20 * math.sin(seed * 0.03)),
+                        video_audit_pass_count=45 + int(15 * math.sin(seed * 0.03)),
+                        video_audit_reject_count=5 + int(3 * math.sin(seed * 0.05)),
+                        report_count=20 + int(10 * math.sin(seed * 0.04)),
+                        video_remove_count=3 + int(2 * math.sin(seed * 0.06)),
+                        active_creators=1000 + int(200 * math.sin(seed * 0.02)),
+                        interactions_count=50000 + int(10000 * math.sin(seed * 0.025)),
+                        new_users=100 + int(50 * math.sin(seed * 0.035)),
+                        earnings=round(5000 + 2000 * math.sin(seed * 0.03) + 500 * math.cos(seed * 0.02), 2),
+                    ))
+            actual_start = dates[0] if dates else start_date
+            actual_end = dates[-1] if dates else end_date
             return success({
                 "period": period, "days": days,
-                "startDate": start_date, "endDate": end_date,
+                "startDate": actual_start, "endDate": actual_end,
                 "dates": dates,
                 "videoPublishCount": [s.video_publish_count for s in stats],
                 "videoAuditPassCount": [s.video_audit_pass_count for s in stats],
@@ -2098,6 +2160,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                 "activeCreators": [s.active_creators for s in stats],
                 "interactionsCount": [s.interactions_count for s in stats],
                 "newUsers": [s.new_users for s in stats],
+                "earnings": [s.earnings for s in stats],
                 "summary": {
                     "totalVideoPublish": sum(s.video_publish_count for s in stats),
                     "totalAuditPass": sum(s.video_audit_pass_count for s in stats),
@@ -2107,6 +2170,7 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
                     "totalRemove": sum(s.video_remove_count for s in stats),
                     "totalInteractions": sum(s.interactions_count for s in stats),
                     "totalNewUsers": sum(s.new_users for s in stats),
+                    "totalEarnings": round(sum(s.earnings for s in stats), 2),
                 }
             })
 
@@ -2114,29 +2178,47 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             period = body.get("period", "7d") if body else "7d"
             start_date = body.get("startDate") if body else None
             end_date = body.get("endDate") if body else None
-            limit = int((body.get("limit", 10) if body else 10))
+            page = int((body.get("page", 1) if body else 1))
+            ps = int((body.get("pageSize", 10) if body else 10))
             sort_by = body.get("sortBy", "heat") if body else "heat"
             days = 7
+            start_ts = 0
+            end_ts = 0
+            actual_start = ""
+            actual_end = ""
             if period == "30d":
                 days = 30
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
             elif period == "custom" and start_date and end_date:
                 try:
-                    t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
-                    t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
-                    days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+                    t1 = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                    t2 = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000)
+                    days = max(1, min(90, int((t2 - t1) / 86400000) + 1))
+                    start_ts = t1
+                    end_ts = t2
                 except:
                     days = 7
+                    end_ts = int(time.time() * 1000)
+                    start_ts = end_ts - 86400000 * (days - 1)
+            else:
+                days = 7
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
+            actual_start = time.strftime("%Y-%m-%d", time.localtime(start_ts / 1000))
+            actual_end = time.strftime("%Y-%m-%d", time.localtime(end_ts / 1000))
             ratio = days / 30.0
             topics = list(db.topics.values())
             result = []
             for t in topics:
-                inc_views = int(t.views_count * ratio * 0.1)
-                inc_likes = int(t.likes_count * ratio * 0.1)
-                inc_comments = int(t.comments_count * ratio * 0.1)
-                inc_collects = int(t.collects_count * ratio * 0.1)
-                inc_shares = int(t.shares_count * ratio * 0.1)
+                seed = hash(t.id + actual_start + actual_end) % 1000
+                inc_views = max(0, int(t.views_count * ratio * (0.05 + 0.001 * (seed % 50))))
+                inc_likes = max(0, int(t.likes_count * ratio * (0.05 + 0.001 * ((seed + 10) % 50))))
+                inc_comments = max(0, int(t.comments_count * ratio * (0.05 + 0.001 * ((seed + 20) % 50))))
+                inc_collects = max(0, int(t.collects_count * ratio * (0.05 + 0.001 * ((seed + 30) % 50))))
+                inc_shares = max(0, int(t.shares_count * ratio * (0.05 + 0.001 * ((seed + 40) % 50))))
                 inc_videos = max(1, int(t.video_count * ratio * 0.05))
-                inc_heat = int(t.heat * ratio * 0.1)
+                inc_heat = inc_views + inc_likes * 2 + inc_comments * 3 + inc_collects * 2 + inc_shares * 5 + inc_videos * 50
                 result.append({
                     "id": t.id,
                     "name": t.name,
@@ -2166,12 +2248,14 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             }
             sort_key = sort_fields.get(sort_by, "periodHeat")
             result.sort(key=lambda x: x.get(sort_key, 0), reverse=True)
+            s, e = (page - 1) * ps, page * ps
             return success({
-                "list": result[:limit],
+                "list": result[s:e],
                 "total": len(result),
+                "page": page, "pageSize": ps, "hasMore": e < len(result),
                 "period": period,
-                "startDate": start_date,
-                "endDate": end_date,
+                "startDate": actual_start,
+                "endDate": actual_end,
                 "days": days
             })
 
@@ -2179,32 +2263,53 @@ def handle_audit(path, qp, uid, body=None, method="GET"):
             period = body.get("period", "7d") if body else "7d"
             start_date = body.get("startDate") if body else None
             end_date = body.get("endDate") if body else None
+            page = int((body.get("page", 1) if body else 1))
+            ps = int((body.get("pageSize", 10) if body else 10))
             days = 7
+            start_ts = 0
+            end_ts = 0
+            actual_start = ""
+            actual_end = ""
             if period == "30d":
                 days = 30
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
             elif period == "custom" and start_date and end_date:
                 try:
-                    t1 = time.mktime(time.strptime(start_date, "%Y-%m-%d"))
-                    t2 = time.mktime(time.strptime(end_date, "%Y-%m-%d"))
-                    days = max(1, min(90, int((t2 - t1) / 86400) + 1))
+                    t1 = int(time.mktime(time.strptime(start_date, "%Y-%m-%d")) * 1000)
+                    t2 = int(time.mktime(time.strptime(end_date, "%Y-%m-%d")) * 1000)
+                    days = max(1, min(90, int((t2 - t1) / 86400000) + 1))
+                    start_ts = t1
+                    end_ts = t2 + 86400000
                 except:
                     days = 7
-            reason_count = {}
-            ratio = days / 30.0
+                    end_ts = int(time.time() * 1000)
+                    start_ts = end_ts - 86400000 * (days - 1)
+            else:
+                days = 7
+                end_ts = int(time.time() * 1000)
+                start_ts = end_ts - 86400000 * (days - 1)
+            actual_start = time.strftime("%Y-%m-%d", time.localtime(start_ts / 1000))
+            actual_end = time.strftime("%Y-%m-%d", time.localtime((end_ts - 86400000) / 1000)) if end_ts > start_ts else actual_start
+            reason_count_period = {}
+            reason_count_total = {}
             for r in db.reports.values():
                 reason = r.reason
-                base_count = reason_count.get(reason, 0)
-                reason_count[reason] = base_count + 1
+                reason_count_total[reason] = reason_count_total.get(reason, 0) + 1
+                if r.created_at >= start_ts and r.created_at < end_ts:
+                    reason_count_period[reason] = reason_count_period.get(reason, 0) + 1
             result = sorted([
-                {"reason": k, "count": max(1, int(v * ratio)), "totalCount": v}
-                for k, v in reason_count.items()
+                {"reason": k, "count": v, "totalCount": reason_count_total.get(k, v)}
+                for k, v in reason_count_period.items()
             ], key=lambda x: x["count"], reverse=True)
+            s, e = (page - 1) * ps, page * ps
             return success({
-                "list": result,
+                "list": result[s:e],
                 "total": len(result),
+                "page": page, "pageSize": ps, "hasMore": e < len(result),
                 "period": period,
-                "startDate": start_date,
-                "endDate": end_date,
+                "startDate": actual_start,
+                "endDate": actual_end,
                 "days": days
             })
 

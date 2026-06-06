@@ -469,6 +469,7 @@ class PlatformStatsDaily:
     active_creators: int
     interactions_count: int
     new_users: int
+    earnings: float
 
     def to_dict(self):
         return {
@@ -481,4 +482,5 @@ class PlatformStatsDaily:
             "activeCreators": self.active_creators,
             "interactionsCount": self.interactions_count,
             "newUsers": self.new_users,
+            "earnings": self.earnings,
         }
